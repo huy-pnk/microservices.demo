@@ -1,0 +1,104 @@
+# ============================================================
+# Gradle
+# ============================================================
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# Per-subproject build outputs
+services/*/build/
+services/*/.gradle/
+proto/build/
+proto/.gradle/
+
+# ============================================================
+# Java / Spring Boot
+# ============================================================
+*.class
+*.jar
+*.war
+*.ear
+*.nar
+out/
+target/
+
+# Spring Boot log files
+spring.log
+*.log
+logs/
+
+# ============================================================
+# IntelliJ IDEA
+# ============================================================
+.idea/
+*.iml
+*.iws
+*.ipr
+*.idea/
+
+# ============================================================
+# VS Code
+# ============================================================
+.vscode/
+
+# ============================================================
+# OS files
+# ============================================================
+# Windows
+Thumbs.db
+Thumbs.db:encdata
+Desktop.ini
+ehthumbs.db
+ehthumbs_vista.db
+$RECYCLE.BIN/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# ============================================================
+# Secrets / environment files
+# ============================================================
+.env
+.env.*
+!.env.example
+!.env.template
+
+# Spring Boot local overrides
+application-local.properties
+application-local.yml
+*/src/main/resources/application-local.properties
+*/src/main/resources/application-local.yml
+
+# Helm / Kubernetes secret values
+*-secret-values.yaml
+*-secrets.yaml
+secrets.yaml
+
+# Keycloak realm exports (may contain hashed credentials)
+*-realm-export.json
+*realm*.json
+
+# ============================================================
+# Protobuf generated sources
+# ============================================================
+generated-sources/
+generated/
+**/generated-sources/
+**/generated/
+services/*/src/main/generated/
+services/*/src/test/generated/
+proto/src/main/generated/
+
+# ============================================================
+# Miscellaneous
+# ============================================================
+*.tmp
+*.bak
+*.swp
+*.orig
+*~

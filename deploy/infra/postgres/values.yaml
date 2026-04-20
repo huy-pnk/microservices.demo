@@ -1,0 +1,26 @@
+auth:
+  postgresPassword: "postgresadmin"
+  database: "postgres"
+
+primary:
+  initdb:
+    scripts:
+      init-dbs.sql: |
+        CREATE DATABASE userdb;
+        CREATE DATABASE productdb;
+        CREATE DATABASE orderdb;
+        CREATE DATABASE inventorydb;
+        CREATE DATABASE keycloakdb;
+  persistence:
+    enabled: true
+    size: 2Gi
+  resources:
+    requests:
+      memory: 256Mi
+      cpu: 250m
+    limits:
+      memory: 512Mi
+      cpu: 500m
+
+readReplicas:
+  replicaCount: 0
