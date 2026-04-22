@@ -1,0 +1,147 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  namespace: data
+spec:
+  clusterIP: None
+  selector:
+    app: kafka
+  ports:
+    - name: broker
+      port: 9092
+      targetPort: 9092
+    - name: controller
+      port: 9093
+      targetPort: 9093
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka
+  namespace: data
+spec:
+  serviceName: kafka
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kafka
+  template:
+    metadata:
+      labels:
+        app: kafka
+    spec:
+      containers:
+        - name: kafka
+          image: apache/kafka:3.7.1
+          ports:
+            - containerPort: 9092
+            - containerPort: 9093
+          env:
+            - name: KAFKA_NODE_ID
+              value: "1"
+            - name: KAFKA_PROCESS_ROLES
+              value: "broker,controller"
+            - name: KAFKA_LISTENERS
+              value: "PLAINTEXT://:9092,CONTROLLER://:9093"
+            - name: KAFKA_ADVERTISED_LISTENERS
+              value: "PLAINTEXT://kafka.data.svc.cluster.local:9092"
+            - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
+              value: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+            - name: KAFKA_CONTROLLER_QUORUM_VOTERS
+              value: "1@localhost:9093"
+            - name: KAFKA_CONTROLLER_LISTENER_NAMES
+              value: "CONTROLLER"
+            - name: KAFKA_INTER_BROKER_LISTENER_NAME
+              value: "PLAINTEXT"
+            - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
+              value: "1"
+            - name: KAFKA_HEAP_OPTS
+              value: "-Xms512m -Xmx512m"
+            - name: KAFKA_AUTO_CREATE_TOPICS_ENABLE
+              value: "false"
+            - name: CLUSTER_ID
+              value: "MkU3OEVBNTcwNTJENDM2Qg"
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/kafka/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
+---
+# Job: pre-create all required Kafka topics.
+# Runs once after the cluster is up; idempotent via --if-not-exists.
+# Uses the same apache/kafka image as the StatefulSet so kafka-topics.sh is available.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kafka-topic-init
+  namespace: data
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      initContainers:
+        # Wait until Kafka is reachable before attempting topic creation.
+        - name: wait-for-kafka
+          image: apache/kafka:3.7.1
+          command:
+            - /bin/sh
+            - -c
+            - |
+              echo "Waiting for Kafka broker to become ready..."
+              until kafka-topics.sh --bootstrap-server kafka.data.svc.cluster.local:9092 --list; do
+                echo "Kafka not ready yet — retrying in 5s"
+                sleep 5
+              done
+              echo "Kafka is ready."
+      containers:
+        - name: create-topics
+          image: apache/kafka:3.7.1
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              BOOTSTRAP=kafka.data.svc.cluster.local:9092
+
+              echo "Creating topic payment.submitted (3 partitions)..."
+              kafka-topics.sh --bootstrap-server $BOOTSTRAP \
+                --create --if-not-exists \
+                --topic payment.submitted \
+                --partitions 3 \
+                --replication-factor 1
+
+              echo "Creating topic payment.result (3 partitions)..."
+              kafka-topics.sh --bootstrap-server $BOOTSTRAP \
+                --create --if-not-exists \
+                --topic payment.result \
+                --partitions 3 \
+                --replication-factor 1
+
+              echo "Creating topic payment.retry (3 partitions)..."
+              kafka-topics.sh --bootstrap-server $BOOTSTRAP \
+                --create --if-not-exists \
+                --topic payment.retry \
+                --partitions 3 \
+                --replication-factor 1
+
+              # DLQ is intentionally single-partition — ordering matters for dead-letter replay
+              echo "Creating topic payment.dlq (1 partition)..."
+              kafka-topics.sh --bootstrap-server $BOOTSTRAP \
+                --create --if-not-exists \
+                --topic payment.dlq \
+                --partitions 1 \
+                --replication-factor 1
+
+              echo "All topics created successfully."
+              kafka-topics.sh --bootstrap-server $BOOTSTRAP --list

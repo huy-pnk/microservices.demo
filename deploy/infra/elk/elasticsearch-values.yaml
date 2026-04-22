@@ -1,0 +1,34 @@
+clusterName: elasticsearch
+replicas: 1
+
+protocol: http
+createCert: false
+
+esConfig:
+  elasticsearch.yml: |
+    xpack.security.enabled: false
+    xpack.security.http.ssl.enabled: false
+    xpack.security.transport.ssl.enabled: false
+
+resources:
+  requests:
+    cpu: 200m
+    memory: 1Gi
+  limits:
+    cpu: 1000m
+    memory: 1Gi
+
+esJavaOpts: "-Xmx512m -Xms512m"
+
+persistence:
+  enabled: true
+  size: 5Gi
+
+service:
+  type: ClusterIP
+
+volumeClaimTemplate:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi
