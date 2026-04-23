@@ -1,0 +1,58 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: api-gateway
+
+  threads:
+    virtual:
+      enabled: true
+
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: ${KEYCLOAK_ISSUER_URI:http://keycloak.localhost:8090/realms/payments}
+          jwk-set-uri: ${KEYCLOAK_ISSUER_URI:http://keycloak.localhost:8090/realms/payments}/protocol/openid-connect/certs
+
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      timeout: 2s
+
+  cloud:
+    gateway:
+      default-filters:
+        - TokenRelay=
+      routes:
+        - id: transaction-service
+          uri: ${TRANSACTION_SERVICE_URL:http://localhost:8081}
+          predicates:
+            - Path=/api/payments/**
+          filters:
+            - name: IdempotencyGuard
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 50
+                redis-rate-limiter.burstCapacity: 100
+                key-resolver: "#{@merchantKeyResolver}"
+
+idempotency:
+  ttl: 24h
+  key-prefix: "idempotency"
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true
+
+logging:
+  config: classpath:logback-spring.xml
