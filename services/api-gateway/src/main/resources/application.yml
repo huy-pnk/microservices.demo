@@ -56,3 +56,5 @@ management:
 
 logging:
   config: classpath:logback-spring.xml
+  level:
+    hp.microservice.demo.api_gateway.aspect.GatewayLoggingAspect: ${GATEWAY_HTTP_LOG_LEVEL:INFO}
