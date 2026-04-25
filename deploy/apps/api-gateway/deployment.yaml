@@ -15,10 +15,6 @@ spec:
       labels:
         app: api-gateway
     spec:
-      hostAliases:
-        - ip: "10.43.0.1"
-          hostnames:
-            - "keycloak.localhost"
       containers:
         - name: api-gateway
           image: micro/api-gateway:dev
@@ -29,7 +25,7 @@ spec:
               name: jdwp
           env:
             - name: JAVA_TOOL_OPTIONS
-              value: "-XX:MaxRAMPercentage=50 -XX:InitialRAMPercentage=25 -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005"
+              value: "-XX:MaxRAMPercentage=50 -XX:InitialRAMPercentage=25 -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005 -Dspring.security.oauth2.resourceserver.jwt.jwk-set-uri=http://keycloak.auth.svc.cluster.local/realms/payments/protocol/openid-connect/certs"
             - name: KEYCLOAK_ISSUER_URI
               valueFrom:
                 configMapKeyRef:

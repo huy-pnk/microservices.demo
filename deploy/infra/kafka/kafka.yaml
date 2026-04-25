@@ -99,7 +99,7 @@ spec:
             - -c
             - |
               echo "Waiting for Kafka broker to become ready..."
-              until kafka-topics.sh --bootstrap-server kafka.data.svc.cluster.local:9092 --list; do
+              until /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka.data.svc.cluster.local:9092 --list; do
                 echo "Kafka not ready yet — retrying in 5s"
                 sleep 5
               done
@@ -115,21 +115,21 @@ spec:
               BOOTSTRAP=kafka.data.svc.cluster.local:9092
 
               echo "Creating topic payment.submitted (3 partitions)..."
-              kafka-topics.sh --bootstrap-server $BOOTSTRAP \
+              /opt/kafka/bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP \
                 --create --if-not-exists \
                 --topic payment.submitted \
                 --partitions 3 \
                 --replication-factor 1
 
               echo "Creating topic payment.result (3 partitions)..."
-              kafka-topics.sh --bootstrap-server $BOOTSTRAP \
+              /opt/kafka/bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP \
                 --create --if-not-exists \
                 --topic payment.result \
                 --partitions 3 \
                 --replication-factor 1
 
               echo "Creating topic payment.retry (3 partitions)..."
-              kafka-topics.sh --bootstrap-server $BOOTSTRAP \
+              /opt/kafka/bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP \
                 --create --if-not-exists \
                 --topic payment.retry \
                 --partitions 3 \
@@ -137,11 +137,11 @@ spec:
 
               # DLQ is intentionally single-partition — ordering matters for dead-letter replay
               echo "Creating topic payment.dlq (1 partition)..."
-              kafka-topics.sh --bootstrap-server $BOOTSTRAP \
+              /opt/kafka/bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP \
                 --create --if-not-exists \
                 --topic payment.dlq \
                 --partitions 1 \
                 --replication-factor 1
 
               echo "All topics created successfully."
-              kafka-topics.sh --bootstrap-server $BOOTSTRAP --list
+              /opt/kafka/bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP --list

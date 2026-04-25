@@ -38,7 +38,7 @@ spec:
             - name: KC_DB
               value: "postgres"
             - name: KC_DB_URL
-              value: "jdbc:postgresql://postgresql.data.svc.cluster.local:5432/keycloakdb"
+              value: "jdbc:postgresql://postgres-postgresql.data.svc.cluster.local:5432/keycloakdb"
             - name: KC_DB_USERNAME
               value: "postgres"
             - name: KC_DB_PASSWORD

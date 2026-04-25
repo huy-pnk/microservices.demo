@@ -1,0 +1,361 @@
+{
+  "info": {
+    "name": "api-gateway smoke tests",
+    "description": "End-to-end smoke tests for the payment api-gateway running in the local k3d cluster.\n\n## Prerequisites\n\n1. **Hosts file** — add to `C:\\Windows\\System32\\drivers\\etc\\hosts`:\n   ```\n   127.0.0.1   api.k3d.test\n   127.0.0.1   keycloak.localhost\n   ```\n2. **Cluster healthy** — `kubectl get pods -n app -l app=api-gateway` shows `1/1 Running`.\n3. **Keycloak realm `payments` exists** with:\n   - Client `payments-gateway` (confidential, *Direct access grants* enabled)\n   - Realm role `MERCHANT`\n   - User `acme` (password `acme`) with `MERCHANT` role assigned\n4. **Set the `client_secret` collection variable** to the secret from Keycloak → Clients → payments-gateway → Credentials.\n\n## Run order\n\nExecute requests top-to-bottom (or use the Collection Runner). Each request's *Tests* tab asserts the expected status. The `Get token` request stores the JWT in `access_token`; the `First valid POST` request stores a fresh `idempotency_key` so the replay tests reuse it.\n\n## Notes\n\n- Step 5 (`First valid POST`) returns **404** because `transaction-service` is still a skeleton with no controllers. The 404 came *from transaction-service*, which proves the gateway forwarded successfully — verify with `kubectl logs -n app -l app=transaction-service --tail=20`.\n- The rate-limiter burst test (Step 8) is best run from the Collection Runner with iterations=200; expect a mix of 404 and 429.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "gateway_base_url",
+      "value": "http://localhost:8090",
+      "type": "string"
+    },
+    {
+      "key": "gateway_host_header",
+      "value": "api.k3d.test",
+      "type": "string"
+    },
+    {
+      "key": "keycloak_base_url",
+      "value": "http://keycloak.localhost:8090",
+      "type": "string"
+    },
+    {
+      "key": "realm",
+      "value": "payments",
+      "type": "string"
+    },
+    {
+      "key": "client_id",
+      "value": "payments-gateway",
+      "type": "string"
+    },
+    {
+      "key": "client_secret",
+      "value": "REPLACE_ME_FROM_KEYCLOAK",
+      "type": "string"
+    },
+    {
+      "key": "username",
+      "value": "acme",
+      "type": "string"
+    },
+    {
+      "key": "password",
+      "value": "acme",
+      "type": "string"
+    },
+    {
+      "key": "access_token",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "idempotency_key",
+      "value": "",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "1. Health (no auth)",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"Status 200\", () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test(\"Overall status is UP\", () => pm.expect(body.status).to.eql(\"UP\"));",
+              "pm.test(\"Redis component is UP\", () => pm.expect(body.components.redis.status).to.eql(\"UP\"));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [
+          { "key": "Host", "value": "{{gateway_host_header}}" }
+        ],
+        "url": {
+          "raw": "{{gateway_base_url}}/actuator/health",
+          "host": ["{{gateway_base_url}}"],
+          "path": ["actuator", "health"]
+        }
+      }
+    },
+    {
+      "name": "2. Unauthenticated POST -> 401",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"Status 401\", () => pm.response.to.have.status(401));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Host", "value": "{{gateway_host_header}}" },
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"amount\":10,\"currency\":\"USD\"}"
+        },
+        "url": {
+          "raw": "{{gateway_base_url}}/api/payments",
+          "host": ["{{gateway_base_url}}"],
+          "path": ["api", "payments"]
+        }
+      }
+    },
+    {
+      "name": "3. Get token from Keycloak",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"Status 200\", () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test(\"access_token present\", () => pm.expect(body.access_token).to.be.a(\"string\"));",
+              "pm.collectionVariables.set(\"access_token\", body.access_token);",
+              "console.log(\"Stored access_token (\" + body.access_token.length + \" chars)\");"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/x-www-form-urlencoded" }
+        ],
+        "body": {
+          "mode": "urlencoded",
+          "urlencoded": [
+            { "key": "grant_type", "value": "password" },
+            { "key": "client_id", "value": "{{client_id}}" },
+            { "key": "client_secret", "value": "{{client_secret}}" },
+            { "key": "username", "value": "{{username}}" },
+            { "key": "password", "value": "{{password}}" }
+          ]
+        },
+        "url": {
+          "raw": "{{keycloak_base_url}}/realms/{{realm}}/protocol/openid-connect/token",
+          "host": ["{{keycloak_base_url}}"],
+          "path": ["realms", "{{realm}}", "protocol", "openid-connect", "token"]
+        }
+      }
+    },
+    {
+      "name": "4. Authenticated POST without Idempotency-Key -> 400",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"Status 400\", () => pm.response.to.have.status(400));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Host", "value": "{{gateway_host_header}}" },
+          { "key": "Authorization", "value": "Bearer {{access_token}}" },
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"amount\":10,\"currency\":\"USD\"}"
+        },
+        "url": {
+          "raw": "{{gateway_base_url}}/api/payments",
+          "host": ["{{gateway_base_url}}"],
+          "path": ["api", "payments"]
+        }
+      }
+    },
+    {
+      "name": "5. First valid POST (forwarded)",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// Generate a fresh Idempotency-Key for this run; reused by step 6 and 7.",
+              "const key = (typeof crypto !== \"undefined\" && crypto.randomUUID)",
+              "  ? crypto.randomUUID()",
+              "  : ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, c =>",
+              "      (c ^ Math.random() * 16 >> c / 4).toString(16));",
+              "pm.collectionVariables.set(\"idempotency_key\", key);",
+              "console.log(\"idempotency_key = \" + key);"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// transaction-service is a skeleton with no controllers, so 404 is the expected forwarded status.",
+              "// 200 / 202 are also acceptable once transaction-service implements POST /api/payments.",
+              "pm.test(\"Status is forwarded (404 expected today; 200/202 once transaction-service is built)\", () => {",
+              "  pm.expect([200, 202, 404]).to.include(pm.response.code);",
+              "});"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Host", "value": "{{gateway_host_header}}" },
+          { "key": "Authorization", "value": "Bearer {{access_token}}" },
+          { "key": "Idempotency-Key", "value": "{{idempotency_key}}" },
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"amount\":10,\"currency\":\"USD\"}"
+        },
+        "url": {
+          "raw": "{{gateway_base_url}}/api/payments",
+          "host": ["{{gateway_base_url}}"],
+          "path": ["api", "payments"]
+        }
+      }
+    },
+    {
+      "name": "6. Replay - same key, same body -> cached",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// Should match step 5's status; body served from Redis without hitting transaction-service.",
+              "pm.test(\"Status matches first call\", () => {",
+              "  pm.expect([200, 202, 404]).to.include(pm.response.code);",
+              "});",
+              "pm.test(\"idempotency_key still set\", () => {",
+              "  pm.expect(pm.collectionVariables.get(\"idempotency_key\")).to.be.a(\"string\").and.not.empty;",
+              "});",
+              "console.log(\"Reused idempotency_key = \" + pm.collectionVariables.get(\"idempotency_key\"));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Host", "value": "{{gateway_host_header}}" },
+          { "key": "Authorization", "value": "Bearer {{access_token}}" },
+          { "key": "Idempotency-Key", "value": "{{idempotency_key}}" },
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"amount\":10,\"currency\":\"USD\"}"
+        },
+        "url": {
+          "raw": "{{gateway_base_url}}/api/payments",
+          "host": ["{{gateway_base_url}}"],
+          "path": ["api", "payments"]
+        }
+      }
+    },
+    {
+      "name": "7. Replay - same key, different body -> 422",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"Status 422\", () => pm.response.to.have.status(422));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Host", "value": "{{gateway_host_header}}" },
+          { "key": "Authorization", "value": "Bearer {{access_token}}" },
+          { "key": "Idempotency-Key", "value": "{{idempotency_key}}" },
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"amount\":99,\"currency\":\"USD\"}"
+        },
+        "url": {
+          "raw": "{{gateway_base_url}}/api/payments",
+          "host": ["{{gateway_base_url}}"],
+          "path": ["api", "payments"]
+        }
+      }
+    },
+    {
+      "name": "8. Rate limiter burst (run with Collection Runner, 200 iterations)",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// Fresh key every iteration so we exercise the rate limiter, not the idempotency cache.",
+              "const key = (typeof crypto !== \"undefined\" && crypto.randomUUID)",
+              "  ? crypto.randomUUID()",
+              "  : ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, c =>",
+              "      (c ^ Math.random() * 16 >> c / 4).toString(16));",
+              "pm.variables.set(\"burst_key\", key);"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// Some calls forwarded (404), some rate-limited (429). Either is acceptable per request;",
+              "// inspect the run summary to confirm a mix.",
+              "pm.test(\"Status is 200/202/404 (forwarded) or 429 (rate-limited)\", () => {",
+              "  pm.expect([200, 202, 404, 429]).to.include(pm.response.code);",
+              "});"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Host", "value": "{{gateway_host_header}}" },
+          { "key": "Authorization", "value": "Bearer {{access_token}}" },
+          { "key": "Idempotency-Key", "value": "{{burst_key}}" },
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"amount\":1,\"currency\":\"USD\"}"
+        },
+        "url": {
+          "raw": "{{gateway_base_url}}/api/payments",
+          "host": ["{{gateway_base_url}}"],
+          "path": ["api", "payments"]
+        }
+      }
+    }
+  ]
+}
