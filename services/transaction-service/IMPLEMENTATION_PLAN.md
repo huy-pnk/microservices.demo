@@ -2,7 +2,7 @@
 
 ## Preliminary findings from codebase inspection
 
-- **Multi-module build**: `microservices.demo/settings.gradle` already includes `services:transaction-service` and `proto`. The root `build.gradle` applies the snapshot repository to all subprojects. The transaction-service `settings.gradle` is standalone-only; it must be updated to reference the snapshot plugin repo and the `proto` composite or the root settings must be the build entry point — more on this in Phase 1.
+- **Multi-module build**: `microservices.demo/settings.gradle` already includes `services:transaction-service` and `proto`. The root `build.gradle` applies the snapshot repository to all subprojects. Transaction-service must always be built from the root `microservices.demo/` directory — the root `settings.gradle` already handles both the `proto` module and this service together.
 - **Proto contracts exist and are compiled**: `fraud.proto` and `fx.proto` are authored. Generated stubs are in `hp.microservice.demo.proto.fraud` and `hp.microservice.demo.proto.fx`. The proto module uses grpc `1.68.0` and protobuf `3.25.5`.
 - **api-gateway conventions to inherit**: Spring Boot `3.5.14-SNAPSHOT`, Spring Cloud `2025.0.0-SNAPSHOT`, `logstash-logback-encoder:8.0`, `micrometer-registry-prometheus`, Lombok, two-stage Dockerfile (`eclipse-temurin:21-jdk` → `eclipse-temurin:21-jre`), `logback-spring.xml` with `JSON_STDOUT` / `local` profile split, `realm_access.roles` → `ROLE_<role>` authority mapping.
 - **No Redis env var in configmap**: the deployment and configmap have no `REDIS_*` keys. Idempotency deduplication in transaction-service must not require Redis — the gateway owns that. Transaction-service deduplication is DB-level (unique constraint on `idempotency_key` in the `transactions` table).
@@ -14,7 +14,7 @@
 
 ### 1.1 Build script changes
 
-Replace the skeleton `build.gradle` with a full dependency set. The `settings.gradle` must be updated to include the snapshot plugin repo **and** composite-build the proto module so the transaction-service can depend on it when built standalone. When built from the root, the root `settings.gradle` already handles inclusion.
+Replace the skeleton `build.gradle` with a full dependency set. Transaction-service must always be built from the root `microservices.demo/` directory — do not run `gradlew.bat` from inside the service directory. The root `settings.gradle` already includes both `proto` and `services:transaction-service`, so no changes to `settings.gradle` are needed.
 
 **Plugins to add:**
 
@@ -22,15 +22,6 @@ Replace the skeleton `build.gradle` with a full dependency set. The `settings.gr
 |---|---|---|
 | Spring Boot | `org.springframework.boot` | `3.5.14-SNAPSHOT` (match api-gateway) |
 | Dependency Management | `io.spring.dependency-management` | `1.1.7` |
-| Protobuf | `com.google.protobuf` | `0.9.4` (match proto module) |
-
-**Spring BOM imports:**
-
-```
-springCloudVersion = '2025.0.0-SNAPSHOT'   // same as api-gateway
-```
-
-No Spring Cloud starter is needed (transaction-service is not a gateway), but the BOM is pulled for consistent version pins.
 
 **Runtime dependencies:**
 
@@ -42,6 +33,7 @@ No Spring Cloud starter is needed (transaction-service is not a gateway), but th
 | `spring-boot-starter-data-jpa` | Hibernate + JPA |
 | `spring-boot-starter-actuator` | `/actuator/health`, metrics |
 | `spring-boot-starter-validation` | `@Valid` on request bodies |
+| `spring-boot-starter-aop` | Required for `RestLoggingAspect` and `GrpcClientLoggingAspect` (Phase 12.1) |
 | `org.postgresql:postgresql` | Driver; version managed by Spring BOM |
 | `org.flywaydb:flyway-core` | Schema migrations; version managed by Spring BOM |
 | `org.flywaydb:flyway-database-postgresql` | Flyway PostgreSQL dialect module (required since Flyway 10) |
@@ -51,11 +43,16 @@ No Spring Cloud starter is needed (transaction-service is not a gateway), but th
 | `io.grpc:grpc-protobuf:1.68.0` | Same |
 | `net.devh:grpc-client-spring-boot-starter:3.1.0.RELEASE` | `@GrpcClient` injection, compatible with Spring Boot 3.5.x |
 | `io.github.resilience4j:resilience4j-spring-boot3:2.2.0` | Circuit breaker + retry; `2.2.0` is the latest GA on Boot 3 |
-| `io.github.resilience4j:resilience4j-grpc:2.2.0` | Resilience4j gRPC decorator |
 | `io.micrometer:micrometer-registry-prometheus` | Metrics scraping |
 | `net.logstash.logback:logstash-logback-encoder:8.0` | Match api-gateway |
 | `project(':proto')` | Generated stubs via multi-module dependency |
 | Lombok (compile-only + annotation processor) | Match api-gateway |
+
+**Compile-only dependencies:**
+
+| Dependency | Notes |
+|---|---|
+| `javax.annotation:javax.annotation-api:1.3.2` | Required because the proto module declares it `compileOnly`; generated stubs reference `@javax.annotation.Generated` and it is not propagated to consumers |
 
 **Test dependencies:**
 
@@ -69,23 +66,47 @@ No Spring Cloud starter is needed (transaction-service is not a gateway), but th
 | `org.testcontainers:junit-jupiter` | JUnit 5 Testcontainers lifecycle |
 | `io.grpc:grpc-testing:1.68.0` | `GrpcCleanupRule`, in-process server for gRPC stub mocking |
 
-The `settings.gradle` needs one addition to support standalone builds:
+**gRPC version conflict resolution:**
+
+`net.devh:grpc-client-spring-boot-starter:3.1.0.RELEASE` ships with `grpc-core:1.65.x` internally. The proto module uses `grpcVersion = '1.68.0'`. Add the following resolution strategy to `build.gradle` to force all gRPC artifacts to `1.68.0`:
 
 ```groovy
-includeBuild '../../proto'
+configurations.all {
+    resolutionStrategy.force(
+        "io.grpc:grpc-core:1.68.0",
+        "io.grpc:grpc-stub:1.68.0",
+        "io.grpc:grpc-protobuf:1.68.0",
+        "io.grpc:grpc-netty-shaded:1.68.0"
+    )
+}
 ```
 
-This lets `project(':proto')` resolve when running `gradlew.bat build` directly from the service directory, without requiring the root build.
+**Minimal `application.yml` required before Phase 5:**
+
+A stub `application.yml` with `spring.security.oauth2.resourceserver.jwt.issuer-uri` and `spring.datasource.*` placeholders must exist before running any Phase 5–6 tests — the Spring context will fail to load without them. Phase 12a expands this to the full version, but these minimum keys must be present from Phase 1 onward:
+
+```yaml
+spring:
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: ${KEYCLOAK_ISSUER_URI:http://keycloak.localhost:8090/realms/payments}
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/paymentdb}
+    username: ${SPRING_DATASOURCE_USERNAME:postgres}
+    password: ${SPRING_DATASOURCE_PASSWORD:postgres}
+```
 
 ### Phase 1 verification
 
-Run from `microservices.demo/services/transaction-service/`:
+Run from `microservices.demo/` (the root — do not run from the service subdirectory):
 
 ```powershell
-.\gradlew.bat dependencies --configuration runtimeClasspath
+.\gradlew.bat :services:transaction-service:dependencies --configuration runtimeClasspath
 ```
 
-Confirm `grpc-netty-shaded`, `spring-kafka`, `flyway-core`, and the proto stub classes resolve with no version conflicts.
+Confirm `grpc-netty-shaded`, `spring-kafka`, `flyway-core`, and the proto stub classes resolve with no version conflicts. Verify all `io.grpc:*` artifacts resolve to `1.68.0` (no `1.65.x` from the starter).
 
 ---
 
@@ -98,7 +119,7 @@ config/
     SecurityConfig               # WebSecurityCustomizer, oauth2ResourceServer, JWT converter
     KafkaProducerConfig          # KafkaTemplate bean, producer factory, idempotent producer props
     KafkaConsumerConfig          # Consumer factory, DefaultErrorHandler, DLT recoverer
-    GrpcClientConfig             # Resilience4j decorators wired around stub channels
+    GrpcClientConfig             # @GrpcClient injection only — no manual Resilience4j decoration
     OutboxSchedulerConfig        # @EnableScheduling, scheduler thread pool
 
 web/
@@ -106,35 +127,629 @@ web/
     PaymentControllerAdvice      # @RestControllerAdvice — maps domain exceptions to ProblemDetail (RFC 9457)
 
 service/
-    PaymentService               # Saga entry point — orchestrates fraud → fx → outbox write
-    FraudCheckService            # Wraps FraudServiceGrpc stub; Resilience4j circuit breaker
-    FxService                    # Wraps FxServiceGrpc stub; Resilience4j circuit breaker
-    OutboxRelayService           # Scheduled poller — reads pending outbox rows, publishes to Kafka, marks sent
-    PaymentResultHandler         # @KafkaListener on payment.result — advances state machine, triggers webhook outbox row
+    PaymentService               # Saga orchestration only — delegates to SagaOrchestrator, FraudGateway, FxGateway
+    SagaOrchestrator             # Holds Map<TransactionStatus, TransactionStateHandler>; dispatches state transitions
+    FraudGateway                 # interface — domain contract for fraud evaluation (DIP)
+    FxGateway                    # interface — domain contract for FX rate locking (DIP)
+    FraudCheckService            # implements FraudGateway — adapter over FraudServiceGrpc stub
+    FxService                    # implements FxGateway — adapter over FxServiceGrpc stub
+    RoutingService               # Encapsulates RoutingRule lookup logic (extracted from PaymentService)
+    OutboxRelayService           # extends AbstractOutboxRelayService<TransactionOutbox> — Kafka relay
+    WebhookRelayService          # extends AbstractOutboxRelayService<TransactionOutbox> — HTTP POST relay (Phase 10)
+    AbstractOutboxRelayService   # abstract — Template Method pattern; polling skeleton
+    PaymentResultHandler         # @KafkaListener on payment.result — advances state machine
+    EventPublisher               # interface — abstracts KafkaTemplate from OutboxRelayService (DIP)
+    KafkaEventPublisher          # implements EventPublisher — wraps KafkaTemplate
+
+service/validation/
+    PaymentValidationStep        # interface — Chain of Responsibility contract
+    CurrencyCodeValidator        # implements PaymentValidationStep
+    AmountRangeValidator         # implements PaymentValidationStep
+    MerchantLimitValidator       # implements PaymentValidationStep
+    PaymentValidationChain       # assembles and runs the ordered chain
+
+service/statehandler/
+    TransactionStateHandler      # interface — Strategy contract for state transitions
+    ReceivedHandler              # handles RECEIVED → FRAUD_CHECKING
+    FraudCheckingHandler         # handles FRAUD_CHECKING → FRAUD_APPROVED / FRAUD_REJECTED
+    FxLockingHandler             # handles FRAUD_APPROVED → FX_LOCKED / SUBMITTED_TO_BANK
+    SubmittedToBankHandler       # handles SUBMITTED_TO_BANK → SUCCEEDED / FAILED / REVERSED
 
 repository/
     TransactionRepository        # JPA repository for Transaction entity
+    TransactionReadRepository    # fragment — query methods used by controllers/read paths
+    TransactionWriteRepository   # fragment — mutation methods used by PaymentService
     OutboxRepository             # JPA repository for TransactionOutbox entity
+    OutboxRelayRepository        # fragment — findPendingBatch, markSent, incrementRetry
     AuditLogRepository           # JPA repository for AuditLog entity
     RoutingRulesRepository       # JPA repository for RoutingRule entity
 
 domain/
     Transaction                  # @Entity — central aggregate
-    TransactionOutbox            # @Entity — outbox table
+    TransactionOutbox            # @Entity — outbox table (base for both Kafka + webhook rows)
     AuditLog                     # @Entity — append-only audit trail
     RoutingRule                  # @Entity — static routing configuration
     TransactionStatus            # enum — state machine values
+    FraudRequest                 # record — domain value object (no proto types)
+    FraudResult                  # record — domain value object
+    FraudVerdict                 # enum — APPROVED / REVIEW / REJECTED
+    FxRateRequest                # record — domain value object
+    FxRateResult                 # record — domain value object
+    SagaContext                  # record — carries transient saga state across handler calls
+    ValidationContext            # record — accumulates validation errors across chain steps
 
 event/
     PaymentSubmittedEvent        # record — published to payment.submitted
     PaymentResultEvent           # record — consumed from payment.result
-    WebhookDispatchEvent         # record — published to outbox for webhook delivery (future)
+    WebhookDispatchEvent         # record — published to outbox for webhook delivery (Phase 10)
+    TransactionStatusChangedEvent # Spring ApplicationEvent — triggers AuditLogListener
+
+factory/
+    TransactionOutboxFactory     # Centralises outbox row construction + JSON serialisation
+
+logging/
+    AuditLogListener             # @TransactionalEventListener — writes AuditLog on status change
+    RestLoggingAspect            # @Aspect — REST controller entry/exit
+    GrpcClientLoggingAspect      # @Aspect — FraudCheckService / FxService entry/exit
+    LogRedactor                  # Utility — centralised field-masking policy
 
 web/dto/
     PaymentRequest               # record — REST inbound, validated
     PaymentResponse              # record — REST outbound
     ErrorResponse                # record — RFC 9457 ProblemDetail wrapper
 ```
+
+---
+
+## Phase 2.1 — Design Patterns and SOLID
+
+This section documents every design pattern and SOLID principle applied across the service. Each entry names the pattern, identifies the exact class or interface it touches, provides a short snippet to make it actionable, and explains why it fits here rather than an alternative.
+
+---
+
+### SOLID: Single Responsibility — `PaymentService`
+
+`PaymentService` in the original sketch orchestrates fraud evaluation, FX locking, routing rule lookup, outbox row construction, and audit log writes — five distinct responsibilities. The decomposition below makes each class answerable for one thing:
+
+| Class | Single responsibility |
+|---|---|
+| `PaymentService` | Accept a validated `PaymentRequest`, resolve merchant identity from the JWT, and invoke the `SagaOrchestrator`. Nothing else. |
+| `SagaOrchestrator` | Dispatch the transaction through `TransactionStateHandler` instances in sequence. |
+| `RoutingService` | Select a `RoutingRule` from the database given `cardNetwork`, `country`, and `fromCurrency`. |
+| `TransactionOutboxFactory` | Construct and persist `TransactionOutbox` rows (owns the JSON serialisation concern). |
+| `AuditLogListener` | Write `AuditLog` rows in response to `TransactionStatusChangedEvent`. |
+
+`PaymentService` after decomposition:
+
+```java
+@Service
+@Transactional
+public class PaymentService {
+
+    private final SagaOrchestrator sagaOrchestrator;
+    private final TransactionRepository transactions;
+
+    public PaymentService(SagaOrchestrator sagaOrchestrator,
+                          TransactionRepository transactions) {
+        this.sagaOrchestrator = sagaOrchestrator;
+        this.transactions = transactions;
+    }
+
+    public Transaction submit(PaymentRequest request, String merchantId, String idempotencyKey) {
+        var tx = Transaction.create(request, merchantId, idempotencyKey);
+        transactions.save(tx);
+        return sagaOrchestrator.advance(tx, SagaContext.initial());
+    }
+}
+```
+
+Every cross-cutting concern (audit, outbox construction, routing) has been moved out. `PaymentService` is now measurably testable with only a `SagaOrchestrator` mock and a repository mock.
+
+---
+
+### SOLID: Single Responsibility — `PaymentControllerAdvice`
+
+`PaymentControllerAdvice` maps several distinct exception families. This is acceptable within a single class because its one responsibility is _exception-to-HTTP-status translation_ — that is a single concern even if the input set is large. However, if the advice grows to include business-rule error enrichment (e.g., fetching the existing transaction for the idempotency key path), extract that lookup into a collaborator:
+
+```java
+@RestControllerAdvice
+public class PaymentControllerAdvice {
+
+    private final TransactionRepository transactions; // injected for idempotency lookup only
+
+    @ExceptionHandler(DataIntegrityViolationException.class)
+    public ResponseEntity<PaymentResponse> handleDuplicate(DataIntegrityViolationException ex,
+                                                            HttpServletRequest request) {
+        String key = extractIdempotencyKey(request);
+        return transactions.findByIdempotencyKey(key)
+                .map(tx -> ResponseEntity.ok(PaymentResponse.from(tx)))
+                .orElseGet(() -> ResponseEntity.internalServerError().build());
+    }
+    // ... other handlers
+}
+```
+
+The idempotency lookup belongs here because it is specific to the HTTP response contract. If it were in `PaymentService`, the service layer would need to know about HTTP headers.
+
+---
+
+### SOLID: Open/Closed — State machine transitions
+
+The ad-hoc if/switch over `TransactionStatus` in `PaymentService` requires modification every time a new state is added. The Strategy pattern (see below) makes the state machine open for extension: new states are added by implementing `TransactionStateHandler` and registering a bean — existing handlers are untouched.
+
+---
+
+### SOLID: Open/Closed — `LogRedactor`
+
+`LogRedactor` currently has a hard-coded list of sensitive field names. Adding a new sensitive field means editing the class. Instead, inject the field list as configuration:
+
+```java
+@Component
+public class LogRedactor {
+
+    private final Set<String> sensitiveFields;
+
+    public LogRedactor(@Value("${logging.redaction.fields:pan,cvv,cvc}") String fields) {
+        this.sensitiveFields = Set.of(fields.split(","));
+    }
+
+    public String sanitise(Object dto) {
+        // reflect over dto fields, redact any whose name is in sensitiveFields
+    }
+}
+```
+
+New sensitive fields are added in `application.yml` under `logging.redaction.fields` — the class is never modified. This satisfies OCP and makes the redaction policy visible in configuration rather than buried in code.
+
+---
+
+### SOLID: Liskov Substitution — `FraudGateway` and `FxGateway`
+
+`FraudCheckService` and `FxService` must honour the same contract regardless of whether a test substitutes a mock or the real gRPC adapter is in use. The contract is: _always return a typed domain result or throw a typed domain exception — never let `StatusRuntimeException` escape_.
+
+```java
+// In domain/ — callers depend only on these
+interface FraudGateway {
+    FraudResult evaluate(FraudRequest request);  // throws FraudServiceUnavailableException
+}
+
+interface FxGateway {
+    FxRateResult lockRate(FxRateRequest request); // throws FxServiceUnavailableException
+}
+```
+
+Any implementation that leaks `StatusRuntimeException` to callers violates LSP because the caller then must know which concrete implementation it has. `GrpcFraudGateway` and `GrpcFxGateway` must catch all `StatusRuntimeException` instances internally and re-raise as the typed domain exception. A mock in `PaymentServiceTest` that never throws `StatusRuntimeException` is then a valid substitute — the test passes, and the contract holds.
+
+---
+
+### SOLID: Interface Segregation — `TransactionRepository`
+
+A single `TransactionRepository` interface will accumulate query methods over time. Controllers need `findById` and `findByMerchantId`; `PaymentService` needs `save`; `OutboxRelayService` never touches `Transaction` rows directly. Split using Spring Data custom repository fragments:
+
+```java
+public interface TransactionReadRepository {
+    Optional<Transaction> findByIdempotencyKey(String key);
+    Page<Transaction> findByMerchantId(String merchantId, Pageable pageable);
+}
+
+public interface TransactionWriteRepository {
+    Transaction save(Transaction tx);
+}
+
+public interface TransactionRepository
+        extends JpaRepository<Transaction, UUID>,
+                TransactionReadRepository,
+                TransactionWriteRepository {}
+```
+
+`PaymentController` can be typed against `TransactionReadRepository` — making it impossible to accidentally call a mutation from the controller. `PaymentService` is typed against `TransactionWriteRepository`. Both depend on the narrowest interface they actually need.
+
+---
+
+### SOLID: Interface Segregation — `OutboxRepository`
+
+The outbox relay poller only needs three operations. The full `JpaRepository` surface exposes `deleteAll`, `saveAll`, and other operations that the relay must never call. Define a narrower fragment:
+
+```java
+public interface OutboxRelayRepository {
+    List<TransactionOutbox> findPendingBatch(int limit);  // @Query + @Lock
+    void markSent(UUID id, Instant sentAt);
+    void incrementRetry(UUID id);
+    void markFailed(UUID id);
+}
+
+public interface OutboxRepository
+        extends JpaRepository<TransactionOutbox, UUID>,
+                OutboxRelayRepository {}
+```
+
+`OutboxRelayService` is injected with `OutboxRelayRepository` — the narrowest possible interface. This makes the test trivial: mock only three methods.
+
+---
+
+### SOLID: Dependency Inversion — `PaymentService` gRPC dependencies
+
+`PaymentService` must not depend on `FraudCheckService` or `FxService` concretely. It depends on `FraudGateway` and `FxGateway` interfaces:
+
+```java
+@Service
+@Transactional
+public class PaymentService {
+
+    private final FraudGateway fraudGateway;
+    private final FxGateway fxGateway;
+    // ...
+
+    public PaymentService(FraudGateway fraudGateway, FxGateway fxGateway, ...) {
+        this.fraudGateway = fraudGateway;
+        this.fxGateway = fxGateway;
+    }
+}
+```
+
+`PaymentServiceTest` then injects `mock(FraudGateway.class)` — no gRPC stub, no `grpc-testing` overhead. The integration test wires `GrpcFraudGateway` via the Spring context.
+
+---
+
+### SOLID: Dependency Inversion — `OutboxRelayService` Kafka dependency
+
+`OutboxRelayService` must not import `KafkaTemplate` directly. It depends on `EventPublisher`:
+
+```java
+public interface EventPublisher {
+    void publish(String topic, String key, Object payload);
+}
+
+@Component
+public class KafkaEventPublisher implements EventPublisher {
+    private final KafkaTemplate<String, Object> kafka;
+
+    public KafkaEventPublisher(KafkaTemplate<String, Object> kafka) {
+        this.kafka = kafka;
+    }
+
+    @Override
+    public void publish(String topic, String key, Object payload) {
+        kafka.send(topic, key, payload).get(5, TimeUnit.SECONDS);
+    }
+}
+```
+
+`OutboxRelayServiceTest` injects an in-memory `EventPublisher` that captures published payloads in a list — no `EmbeddedKafkaBroker` needed in the unit test.
+
+---
+
+### Pattern: Strategy — State machine transitions
+
+The state machine currently described as ad-hoc if/switch logic inside `PaymentService` is replaced with a `TransactionStateHandler` strategy interface. Each state owns its own transition logic:
+
+```java
+// In service/statehandler/
+public interface TransactionStateHandler {
+    TransactionStatus handles();
+    Transaction advance(Transaction tx, SagaContext ctx);
+}
+
+// Example implementation
+@Component
+public class FraudCheckingHandler implements TransactionStateHandler {
+
+    private final FraudGateway fraudGateway;
+
+    public FraudCheckingHandler(FraudGateway fraudGateway) {
+        this.fraudGateway = fraudGateway;
+    }
+
+    @Override
+    public TransactionStatus handles() { return TransactionStatus.FRAUD_CHECKING; }
+
+    @Override
+    public Transaction advance(Transaction tx, SagaContext ctx) {
+        FraudResult result = fraudGateway.evaluate(FraudRequest.from(tx));
+        return switch (result.verdict()) {
+            case APPROVED -> tx.withStatus(TransactionStatus.FRAUD_APPROVED)
+                              .withFraudVerdict(result);
+            case REJECTED -> tx.withStatus(TransactionStatus.FRAUD_REJECTED)
+                              .withFraudVerdict(result);
+            case REVIEW   -> tx.withStatus(TransactionStatus.FRAUD_APPROVED)
+                              .withFraudVerdict(result); // policy decision — treat REVIEW as pass
+        };
+    }
+}
+```
+
+`SagaOrchestrator` holds a `Map<TransactionStatus, TransactionStateHandler>` assembled from all handler beans:
+
+```java
+@Service
+public class SagaOrchestrator {
+
+    private final Map<TransactionStatus, TransactionStateHandler> handlers;
+
+    public SagaOrchestrator(List<TransactionStateHandler> handlerList) {
+        this.handlers = handlerList.stream()
+                .collect(Collectors.toUnmodifiableMap(
+                        TransactionStateHandler::handles,
+                        Function.identity()));
+    }
+
+    public Transaction advance(Transaction tx, SagaContext ctx) {
+        TransactionStateHandler handler = handlers.get(tx.getStatus());
+        if (handler == null) return tx; // terminal state
+        Transaction next = handler.advance(tx, ctx);
+        return advance(next, ctx); // recurse until terminal
+    }
+}
+```
+
+Adding `REVERSED` handling in the future means adding `ReversedHandler` — zero changes to `SagaOrchestrator` or any existing handler.
+
+---
+
+### Pattern: Chain of Responsibility — Validation pipeline
+
+Bean Validation catches structural violations (`@NotNull`, `@Size`). Business-rule validation (ISO 4217 currency check, amount ceiling, merchant daily limit) cannot be expressed as annotations and does not belong in `PaymentService`. A chain makes each rule independently testable and adds new rules without touching existing ones:
+
+```java
+// In service/validation/
+public interface PaymentValidationStep {
+    void validate(PaymentRequest request, ValidationContext ctx)
+            throws PaymentValidationException;
+}
+
+@Component
+public class CurrencyCodeValidator implements PaymentValidationStep {
+    private static final Set<String> ISO_4217 = Set.of(/* ... */);
+
+    @Override
+    public void validate(PaymentRequest request, ValidationContext ctx) {
+        if (!ISO_4217.contains(request.fromCurrency()))
+            throw new PaymentValidationException("Invalid fromCurrency: " + request.fromCurrency());
+        if (!ISO_4217.contains(request.toCurrency()))
+            throw new PaymentValidationException("Invalid toCurrency: " + request.toCurrency());
+    }
+}
+
+@Component
+public class PaymentValidationChain {
+    private final List<PaymentValidationStep> steps;
+
+    public PaymentValidationChain(List<PaymentValidationStep> steps) {
+        this.steps = steps; // Spring injects all PaymentValidationStep beans in declaration order
+    }
+
+    public void validate(PaymentRequest request) {
+        ValidationContext ctx = new ValidationContext();
+        for (PaymentValidationStep step : steps) step.validate(request, ctx);
+    }
+}
+```
+
+`PaymentController` calls `validationChain.validate(request)` before handing off to `PaymentService`. Each step is unit-tested in isolation. A new rule (`MerchantLimitValidator`) is added by implementing the interface and annotating with `@Component` — no existing class is modified.
+
+---
+
+### Pattern: Template Method — Outbox relay and webhook relay
+
+`OutboxRelayService` (Kafka publish) and `WebhookRelayService` (HTTP POST, Phase 10) share the same polling skeleton. The invariant part — fetch pending rows, iterate, mark sent or increment retry, enforce failure cutoff — is extracted into `AbstractOutboxRelayService`:
+
+```java
+// In service/
+public abstract class AbstractOutboxRelayService<T extends TransactionOutbox> {
+
+    @Scheduled(fixedDelay = 500)
+    public final void pollAndRelay() {
+        List<T> batch = fetchPendingBatch();
+        for (T row : batch) {
+            try {
+                dispatch(row);
+                markSent(row);
+            } catch (Exception ex) {
+                markFailed(row, ex);
+            }
+        }
+    }
+
+    protected abstract List<T> fetchPendingBatch();
+    protected abstract void dispatch(T row) throws Exception;
+    protected abstract void markSent(T row);
+    protected abstract void markFailed(T row, Exception cause);
+}
+
+@Service
+public class OutboxRelayService extends AbstractOutboxRelayService<TransactionOutbox> {
+
+    private final OutboxRelayRepository outbox;
+    private final EventPublisher publisher;
+
+    @Override
+    protected List<TransactionOutbox> fetchPendingBatch() {
+        return outbox.findPendingBatch(50);
+    }
+
+    @Override
+    protected void dispatch(TransactionOutbox row) throws Exception {
+        publisher.publish("payment.submitted", row.getPartitionKey(), row.getPayload());
+    }
+
+    @Override
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    protected void markSent(TransactionOutbox row) {
+        outbox.markSent(row.getId(), Instant.now());
+    }
+
+    @Override
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    protected void markFailed(TransactionOutbox row, Exception cause) {
+        outbox.incrementRetry(row.getId());
+        if (row.getRetryCount() + 1 >= 5) outbox.markFailed(row.getId());
+    }
+}
+```
+
+`WebhookRelayService` extends the same abstract class and overrides only `dispatch` (HTTP POST via `RestClient`). The scheduling and retry accounting are never duplicated.
+
+---
+
+### Pattern: Factory — Outbox row construction
+
+`TransactionOutboxFactory` centralises all `TransactionOutbox` construction. Without it, JSON serialisation and field mapping are scattered wherever a row is created (`PaymentService`, `PaymentResultHandler`, eventually `WebhookRelayService`):
+
+```java
+// In factory/
+@Component
+public class TransactionOutboxFactory {
+
+    private final ObjectMapper mapper;
+
+    public TransactionOutboxFactory(ObjectMapper mapper) {
+        this.mapper = mapper;
+    }
+
+    public TransactionOutbox paymentSubmitted(Transaction tx, PaymentSubmittedEvent event) {
+        return TransactionOutbox.builder()
+                .id(UUID.randomUUID())
+                .transactionId(tx.getId())
+                .eventType("payment.submitted")
+                .payload(serialise(event))
+                .partitionKey(tx.getId().toString())
+                .status(OutboxStatus.PENDING)
+                .build();
+    }
+
+    public TransactionOutbox webhookDispatch(Transaction tx, String callbackUrl, Object payload) {
+        return TransactionOutbox.builder()
+                .id(UUID.randomUUID())
+                .transactionId(tx.getId())
+                .eventType("webhook.dispatch")
+                .payload(serialise(Map.of("callbackUrl", callbackUrl, "body", payload)))
+                .partitionKey(tx.getId().toString())
+                .status(OutboxStatus.PENDING)
+                .build();
+    }
+
+    private String serialise(Object obj) {
+        try { return mapper.writeValueAsString(obj); }
+        catch (JsonProcessingException ex) { throw new IllegalArgumentException("Outbox serialisation failed", ex); }
+    }
+}
+```
+
+`PaymentService` receives `TransactionOutboxFactory` via constructor injection and calls `factory.paymentSubmitted(tx, event)` — it never touches `ObjectMapper`. The factory is testable independently: verify that the correct `event_type`, `partition_key`, and payload shape are produced for each event type.
+
+---
+
+### Pattern: Adapter — gRPC boundary isolation
+
+Proto-generated types (`FraudServiceGrpc.FraudServiceBlockingStub`, proto request/response messages) must not appear anywhere in `service/` except inside the adapter implementations. `PaymentService` and `SagaOrchestrator` work exclusively with domain value objects.
+
+```java
+// In service/ — domain interfaces (DIP, LSP)
+public interface FraudGateway {
+    FraudResult evaluate(FraudRequest request); // throws FraudServiceUnavailableException
+}
+
+// In service/ — gRPC adapter
+public class GrpcFraudGateway implements FraudGateway {
+
+    private final FraudServiceGrpc.FraudServiceBlockingStub stub;
+
+    public GrpcFraudGateway(FraudServiceGrpc.FraudServiceBlockingStub stub) {
+        this.stub = stub;
+    }
+
+    @Override
+    @CircuitBreaker(name = "fraud-service", fallbackMethod = "fallback")
+    @Retry(name = "fraud-service")
+    public FraudResult evaluate(FraudRequest request) {
+        try {
+            var protoReq = FraudCheckRequest.newBuilder()
+                    .setTransactionId(request.transactionId().toString())
+                    .setAmount(request.amount().toPlainString())
+                    .setMerchantId(request.merchantId())
+                    .setCountry(request.country())
+                    .build();
+            var protoResp = stub.withDeadlineAfter(3, TimeUnit.SECONDS)
+                                .checkFraud(protoReq);
+            return new FraudResult(
+                    FraudVerdict.valueOf(protoResp.getVerdict().name()),
+                    protoResp.getReason());
+        } catch (StatusRuntimeException ex) {
+            throw new FraudServiceUnavailableException("gRPC call failed: " + ex.getStatus(), ex);
+        }
+    }
+
+    private FraudResult fallback(FraudRequest request, Exception ex) {
+        throw new FraudServiceUnavailableException("Circuit open", ex);
+    }
+}
+```
+
+Apply the same pattern for `GrpcFxGateway implements FxGateway`. Domain value objects (`FraudRequest`, `FraudResult`, `FraudVerdict`, `FxRateRequest`, `FxRateResult`) live in `domain/`. The proto module is imported only by the two adapter classes.
+
+---
+
+### Pattern: Observer / Event — Audit log decoupling
+
+`PaymentService` publishing `TransactionStatusChangedEvent` via `ApplicationEventPublisher` removes the direct dependency on `AuditLogRepository`:
+
+```java
+// Published inside PaymentService (or inside each TransactionStateHandler) on every state change:
+eventPublisher.publishEvent(
+    new TransactionStatusChangedEvent(tx.getId(), oldStatus, newStatus, actorId));
+```
+
+```java
+// In logging/ — separate listener
+@Component
+public class AuditLogListener {
+
+    private final AuditLogRepository auditLogs;
+
+    public AuditLogListener(AuditLogRepository auditLogs) {
+        this.auditLogs = auditLogs;
+    }
+
+    @TransactionalEventListener(phase = TransactionPhase.BEFORE_COMMIT)
+    public void on(TransactionStatusChangedEvent event) {
+        auditLogs.save(AuditLog.builder()
+                .transactionId(event.transactionId())
+                .event("STATUS_CHANGED")
+                .oldValue(event.oldStatus().name())
+                .newValue(event.newStatus().name())
+                .actor(event.actorId())
+                .build());
+    }
+}
+```
+
+**`BEFORE_COMMIT` vs `AFTER_COMMIT`:** Use `BEFORE_COMMIT` here. The audit log write must be in the same database transaction as the state change and outbox row write. If a crash occurs after the outer transaction commits but before `AFTER_COMMIT` listeners fire, the audit entry is lost permanently — a hard invariant violation for a payment audit trail. `BEFORE_COMMIT` places the audit write inside the same transaction boundary, so it either all commits or all rolls back together.
+
+A future listener (e.g., a Micrometer counter increment) that does not need DB durability can safely use `AFTER_COMMIT`.
+
+---
+
+### Pattern: Decorator — Resilience4j wrapping
+
+The plan describes manually wrapping stub calls with `CircuitBreaker.decorateCheckedSupplier`. Annotation-based Resilience4j is the better choice for this Spring Boot service: it removes boilerplate from `GrpcFraudGateway` and `GrpcFxGateway` and integrates automatically with Micrometer metrics via `resilience4j-micrometer`.
+
+```java
+@CircuitBreaker(name = "fraud-service", fallbackMethod = "fallback")
+@Retry(name = "fraud-service")
+public FraudResult evaluate(FraudRequest request) {
+    // gRPC call only — no manual decoration boilerplate
+}
+
+private FraudResult fallback(FraudRequest request, Exception ex) {
+    throw new FraudServiceUnavailableException("Circuit open", ex);
+}
+```
+
+The `fallback` method must accept the same parameter types as the annotated method plus a trailing `Exception` parameter — Resilience4j requires this signature for fallback resolution.
+
+`GrpcClientConfig` becomes minimal — it only registers the `@GrpcClient`-injected stubs as beans and provides the adapter implementations. No manual `CircuitBreaker.decorateCheckedSupplier` chains.
+
+**Trade-off acknowledged:** annotation-based Resilience4j requires Spring AOP proxying, so calls from within the same bean bypass the circuit breaker. `GrpcFraudGateway.evaluate` is only ever called from `SagaOrchestrator` (a different bean), so this is not an issue here. If self-invocation were needed, inject `self` or use the programmatic API — but that situation does not arise in this design.
 
 ---
 
@@ -147,15 +762,14 @@ RECEIVED
   └─► FRAUD_CHECKING
         ├─► FRAUD_REJECTED  (terminal)
         └─► FRAUD_APPROVED
-              └─► FX_LOCKING        (only when from_currency != to_currency)
-              └─► ROUTING            (currencies match, skip FX)
+              └─► FX_LOCKED          (rate locked; null if same currency — saga skips FX call)
                     └─► SUBMITTED_TO_BANK
                           ├─► SUCCEEDED   (terminal)
                           ├─► FAILED      (terminal)
                           └─► REVERSED    (terminal — compensation)
 ```
 
-`FRAUD_CHECKING`, `FX_LOCKING`, `ROUTING` are in-progress states used when calls are made. The saga calls fraud and fx synchronously within the REST request thread before writing the outbox row (see Phase 9 for justification). If either call fails, the transaction moves to `FRAUD_REJECTED` or a `FAILED` terminal state without emitting to the bank.
+`FRAUD_CHECKING` and `FX_LOCKED` are in-progress states used when calls are made. `ROUTING` is not a visible state — routing rule selection (looking up `RoutingRule` by `cardNetwork`/`country`/`fromCurrency` and setting `bank_connector_id`) is an internal synchronous step inside the saga, not an observable state transition. The saga calls fraud and fx synchronously within the REST request thread before writing the outbox row (see Phase 9 for justification). If either call fails, the transaction moves to `FRAUD_REJECTED` or a `FAILED` terminal state without emitting to the bank.
 
 ### V1__create_transactions.sql
 
@@ -246,7 +860,7 @@ Seed a default catch-all row in the same migration.
 |---|---|---|---|---|
 | `POST` | `/api/v1/payments` | JWT required | `MERCHANT` | Submit a payment; requires `Idempotency-Key` header |
 | `GET` | `/api/v1/payments/{id}` | JWT required | `MERCHANT` | Fetch single payment (merchant sees only their own) |
-| `GET` | `/api/v1/payments` | JWT required | `MERCHANT` | Paginated list, filtered by merchant_id from JWT |
+| `GET` | `/api/v1/payments` | JWT required | `MERCHANT` | Paginated list, filtered by merchant_id from JWT; accepts `?page=0&size=20&sort=createdAt,desc` (default page 0, size 20, sorted by `createdAt` descending); repository method: `findByMerchantId(String merchantId, Pageable pageable)` |
 | `GET` | `/api/v1/payments/{id}/audit` | JWT required | `ADMIN` | Audit trail for a transaction |
 | `GET` | `/actuator/health` | Open | — | Kubernetes probes |
 
@@ -281,6 +895,8 @@ updatedAt       Instant
 
 The gateway has already checked the `Idempotency-Key` in Redis and returned a cached response if the key was seen before. Transaction-service provides a second, durable layer: the `idempotency_key` column has a UNIQUE constraint. On a duplicate `POST` that slips through (e.g., Redis TTL expired, gateway restart), the service catches `DataIntegrityViolationException` on the unique constraint, looks up the existing transaction by `idempotency_key`, and returns `200 OK` with the existing record — not `409`. This is the correct payment API semantics: idempotency means "same result," not "error on repeat."
 
+**PK collision edge case:** `PaymentRequest` includes an optional client-supplied `transactionId`. If a client supplies a UUID that collides with an existing record's primary key (not via the idempotency key), the `DataIntegrityViolationException` handler in `PaymentControllerAdvice` will look up by `idempotency_key` and find nothing, resulting in a 500 error. The recommended fix: `PaymentControllerAdvice` must distinguish between a PK violation and a unique constraint violation on `idempotency_key` by inspecting the constraint name in the exception. Alternatively — and simpler — the server should always generate `transactionId` internally and the client-supplied field should be removed from `PaymentRequest`.
+
 ### Error model
 
 Use Spring's built-in `ProblemDetail` (RFC 9457). `PaymentControllerAdvice` maps:
@@ -304,7 +920,9 @@ spring.security.oauth2.resourceserver.jwt.issuer-uri: ${KEYCLOAK_ISSUER_URI}
 
 The `issuer-uri` causes Spring to auto-fetch JWKS from `<issuer>/.well-known/openid-configuration` at startup. Offline validation on every request — no per-request Keycloak round-trip.
 
-**Role mapping:** Mirror api-gateway exactly. Implement a `JwtAuthenticationConverter` that reads `realm_access.roles`, prefixes `ROLE_`, and returns a `Collection<GrantedAuthority>`. Place in `config/SecurityConfig.java`.
+**Role mapping:** Implement a `JwtAuthenticationConverter` (non-reactive, servlet-stack) that reads `realm_access.roles`, prefixes `ROLE_`, and returns a `Collection<GrantedAuthority>`. Wire it via `jwtAuthenticationConverter.setJwtGrantedAuthoritiesConverter(...)` and register on the `HttpSecurity` resource server config. Place in `config/SecurityConfig.java`.
+
+Do **not** use `ReactiveJwtAuthenticationConverter` — that is WebFlux-only and will fail on a servlet stack. The api-gateway uses `ReactiveJwtAuthenticationConverter` because it is reactive; transaction-service uses `spring-boot-starter-web` and must use the non-reactive equivalent.
 
 **Method security:** Use `@EnableMethodSecurity` and `@PreAuthorize("hasRole('MERCHANT')")` on controller methods rather than blanket `authorizeHttpRequests` path patterns — this is more maintainable as endpoints grow. Actuator paths remain open at the `HttpSecurity` level.
 
@@ -353,7 +971,8 @@ Both stubs are I/O calls to external services — must be wrapped.
 | `permittedCallsInHalfOpenState` | 3 | |
 | Retry `maxAttempts` | 2 | 1 retry; gRPC is idempotent here |
 | Retry `waitDuration` | 200ms | |
-| TimeLimiter `timeoutDuration` | 3s | Fail fast if fraud-service is stuck |
+
+Do **not** use Resilience4j `TimeLimiter` for the gRPC timeout. `TimeLimiter` wraps calls in a `Future` and is designed for `CompletableFuture`-based async operations. For blocking gRPC stubs, apply the deadline directly on the stub: `stub.withDeadlineAfter(3, TimeUnit.SECONDS)`. This uses gRPC's own deadline propagation mechanism and is the correct approach for blocking stubs. Apply this in `FraudCheckService.evaluate()` and `FxService.lockRate()`.
 
 `FraudCheckService.evaluate()` wraps the blocking stub call with Resilience4j `CircuitBreaker.decorateCheckedSupplier` + `Retry.decorateCheckedSupplier`. Throw a `FraudServiceUnavailableException` when the circuit is open — the saga catches this and transitions the transaction to `FAILED` with a recorded reason.
 
@@ -367,12 +986,14 @@ Same pattern for `FxService.lockRate()` with its own circuit breaker instance.
 
 | Topic | Partitions | Producer | Consumer |
 |---|---|---|---|
-| `payment.submitted` | 6 | transaction-service (via outbox relay) | bank-connector |
-| `payment.result` | 6 | bank-connector | transaction-service |
-| `payment.retry` | 6 | DefaultErrorHandler | transaction-service |
+| `payment.submitted` | 3 | transaction-service (via outbox relay) | bank-connector |
+| `payment.result` | 3 | bank-connector | transaction-service |
+| `payment.retry` | 3 | DefaultErrorHandler | transaction-service |
 | `payment.dlq` | 1 | DeadLetterPublishingRecoverer | — (manual inspection) |
 
 Partition by `transactionId` (string) on all topics — consistent ordering per transaction across the pipeline.
+
+Partition count is 3 to match the existing `kafka.yaml` init Job in the cluster. If 6 partitions are preferred, update the Kafka init Job to create topics at 6 partitions before deploying — the init Job and this plan must stay in sync.
 
 ### Producer config (KafkaProducerConfig)
 
@@ -405,7 +1026,10 @@ spring:
       properties:
         spring.json.trusted.packages: "hp.microservice.demo.transaction_service.event"
         spring.json.value.default.type: "hp.microservice.demo.transaction_service.event.PaymentResultEvent"
+        spring.json.use.type.headers: false
 ```
+
+`spring.json.use.type.headers: false` is required because the producer sets `spring.json.add.type.headers: false` (no type headers on the wire). Without this, the consumer falls back to fragile header-based type resolution and may fail or silently deserialize to the wrong type.
 
 `DefaultErrorHandler` in `KafkaConsumerConfig` bean:
 
@@ -413,7 +1037,13 @@ spring:
 - `DeadLetterPublishingRecoverer` → `payment.dlq` topic after exhaustion
 - Also configure a `RetryTopicConfiguration` bean for `payment.retry` if retry-topic pattern is preferred over local retries — the `@RetryableTopic` approach is cleaner but adds infrastructure topic; start with `DefaultErrorHandler` local retries, defer retry topic to a follow-on phase.
 
-Manual offset commit (`AckMode.MANUAL_IMMEDIATE`). `PaymentResultHandler` calls `acknowledgment.acknowledge()` only after the DB state transition is committed.
+Manual offset commit (`AckMode.MANUAL_IMMEDIATE`). `PaymentResultHandler` calls `acknowledgment.acknowledge()` only after the DB state transition is committed. `AckMode.MANUAL_IMMEDIATE` requires the `@KafkaListener` method signature to include `Acknowledgment` as a parameter:
+
+```java
+public void handle(PaymentResultEvent event, Acknowledgment acknowledgment)
+```
+
+Omitting the `Acknowledgment` parameter causes the container to use automatic offset commit regardless of the configured `AckMode`.
 
 ### Event POJOs (event/)
 
@@ -437,13 +1067,15 @@ No Jackson `@JsonTypeInfo` — type resolution is explicit via `value.default.ty
 
 The outbox table (`transaction_outbox`) is written **in the same local DB transaction** as the state change. The `@Transactional` boundary in `PaymentService` covers both the `transactions` insert/update and the `transaction_outbox` insert. Kafka is not touched inside the transaction.
 
-A separate `@Scheduled` poller in `OutboxRelayService` runs every 500ms:
+A separate `@Scheduled(fixedDelay = 500)` poller in `OutboxRelayService` runs 500ms after the previous execution completes:
 
 1. Fetch up to 50 rows WHERE `status = 'PENDING'` ORDER BY `created_at` (FIFO per transaction, via index).
 2. For each row: send to Kafka with `transactionId` as the message key (guarantees partition ordering).
 3. On successful send (synchronous `KafkaTemplate.send(...).get()` with a 5s timeout): update row to `SENT`, set `sent_at = now()`.
 4. On failure: increment `retry_count`; if `retry_count >= 5`, set `status = 'FAILED'` (manual intervention needed; reconciliation-service will flag it).
 5. Steps 3/4 run in a new `@Transactional(REQUIRES_NEW)` per row so one failed row does not roll back others.
+
+Use `@Scheduled(fixedDelay = 500)` — not `fixedRate`. With `fixedRate`, if a poll iteration takes longer than 500ms (e.g., a slow Kafka send), the next execution starts immediately after the previous finishes, causing overlapping executions. `fixedDelay` ensures the 500ms gap is always measured from completion, not from start.
 
 The polling interval of 500ms is acceptable for a learning cluster. In production, transactional outbox polling is typically replaced by Debezium CDC, but that is explicitly deferred.
 
@@ -468,7 +1100,7 @@ Client          PaymentController       PaymentService     FraudCheckService   F
   │  Idempotency-Key   │                      │                    │               │            │              │           │
   │                    │─submit(request,jwt)──►│                    │               │            │              │           │
   │                    │                      │─persist RECEIVED──────────────────────────────►│              │           │
-  │                    │                      │  + outbox(PENDING) ──────────────────────────►│              │           │
+  │                    │                      │  + audit_log(RECEIVED)────────────────────────►│              │           │
   │                    │                      │  (single tx commit)────────────────────────── commit         │           │
   │                    │                      │                    │               │            │              │           │
   │                    │                      │─evaluate(...)─────►│               │            │              │           │
@@ -489,15 +1121,7 @@ Client          PaymentController       PaymentService     FraudCheckService   F
   │                    │                      │                    │               │            │◄─mark SENT───│           │
 ```
 
-Note: the initial `RECEIVED + outbox(PENDING)` row is an internal tracking row (event_type=`payment.initiated`, for audit). The `payment.submitted` outbox row is written **after** fraud and FX have succeeded. This is the cleanest model: if fraud rejects, no outbox event is written and bank-connector never sees the payment.
-
-**Clarification on the two outbox writes:**
-- Write 1 (RECEIVED): captures that the payment arrived — useful for reconciliation but not sent to bank-connector.
-- Write 2 (payment.submitted, after fraud+fx): the actual event consumed by bank-connector.
-
-Only Write 2 goes to the `payment.submitted` Kafka topic. Write 1 can be omitted from Kafka and kept purely in `audit_log` if the audit log captures the `RECEIVED` transition.
-
-**Simpler model (what to implement):** One outbox write per transaction, written after fraud+fx succeed. The `RECEIVED` state transition is recorded in `audit_log` directly (synchronous DB write, no outbox needed). This avoids phantom `payment.submitted` events for fraud-rejected transactions.
+One outbox write per transaction, written after fraud and FX have succeeded. The `RECEIVED` state transition is recorded in `audit_log` directly — no outbox row for it. If fraud rejects, no outbox event is written and bank-connector never sees the payment.
 
 ### Compensation paths
 
@@ -594,6 +1218,7 @@ spring:
       properties:
         spring.json.trusted.packages: "hp.microservice.demo.transaction_service.event"
         spring.json.value.default.type: "hp.microservice.demo.transaction_service.event.PaymentResultEvent"
+        spring.json.use.type.headers: false
 
   security:
     oauth2:
@@ -631,12 +1256,6 @@ resilience4j:
       fx-service:
         maxAttempts: 2
         waitDuration: 200ms
-  timelimiter:
-    instances:
-      fraud-service:
-        timeoutDuration: 3s
-      fx-service:
-        timeoutDuration: 3s
 
 management:
   endpoints:
@@ -652,6 +1271,8 @@ management:
 logging:
   config: classpath:logback-spring.xml
 ```
+
+**Note on `SPRING_DATASOURCE_USERNAME`:** The `deployment.yaml` maps `SPRING_DATASOURCE_PASSWORD` from the secret but not `SPRING_DATASOURCE_USERNAME`. The default value `postgres` above matches the cluster Postgres setup. For explicitness, add `SPRING_DATASOURCE_USERNAME` to the `transaction-service-config` ConfigMap so the value is visible in the manifest rather than being an invisible default.
 
 ---
 
@@ -677,6 +1298,94 @@ A `OncePerRequestFilter` (placed in `config/`) handles this systematically:
 For Kafka listeners: `PaymentResultHandler` extracts `transactionId` from the `PaymentResultEvent` and puts it in MDC at the start of processing, clears at the end.
 
 gRPC calls: pass `traceId` as gRPC metadata header `x-trace-id` via a `ClientInterceptor` registered on both stubs.
+
+---
+
+## Phase 12.1 — Request/response logging via AOP
+
+### Package placement
+
+Place all logging aspects and the `LogRedactor` utility in a dedicated `logging/` sub-package rather than `config/`. `config/` is reserved for Spring bean wiring; these classes carry domain-aware redaction logic that is tested independently and is not Spring-infrastructure. `logging/` makes that boundary explicit.
+
+```
+logging/
+    RestLoggingAspect          # @Aspect — REST controller entry/exit
+    GrpcClientLoggingAspect    # @Aspect — FraudCheckService / FxService entry/exit
+    LogRedactor                # Utility — centralised field-masking policy
+```
+
+### REST payload logging — `RestLoggingAspect`
+
+```java
+@Around("within(@org.springframework.web.bind.annotation.RestController *) && within(hp.microservice.demo.transaction_service.web..*)")
+public Object logRestCall(ProceedingJoinPoint pjp) throws Throwable { ... }
+```
+
+On entry (INFO): method signature, sanitised request DTO via `LogRedactor`.
+On exit (INFO): sanitised response DTO, `latencyMs`.
+On exception (WARN): exception class + message, `latencyMs`.
+
+Because `MDC` already carries `traceId`, `merchantId`, and (after `PaymentService` writes the entity) `transactionId`, every log line emitted inside the aspect is automatically correlatable — no extra fields need to be injected into the log statement itself.
+
+Full payload bodies are gated at DEBUG level:
+
+```yaml
+logging:
+  payload:
+    enabled: false    # set true in local dev; never enable in prod
+```
+
+In code, check `log.isDebugEnabled()` before serializing the DTO to a string — payload serialization is not free even with virtual threads.
+
+### gRPC client payload logging — `GrpcClientLoggingAspect`
+
+```java
+@Around("execution(public * hp.microservice.demo.transaction_service.service.FraudCheckService.*(..)) || execution(public * hp.microservice.demo.transaction_service.service.FxService.*(..))")
+public Object logGrpcCall(ProceedingJoinPoint pjp) throws Throwable { ... }
+```
+
+Logs the proto request (INFO on entry), proto response (INFO on exit), `latencyMs`, and the Resilience4j outcome — distinguish `CallNotPermittedException` (circuit open) from a real gRPC `StatusRuntimeException` so ops can tell "circuit open" from "service actually failed".
+
+**Alternative — gRPC `ClientInterceptor`:** a `ClientInterceptor` can intercept at the transport layer and log raw headers + message bytes. Prefer AOP here because: (a) the domain-level service objects are already the right granularity for redaction; (b) the Resilience4j outcome is visible at the service method level, not at the transport level; (c) the `ClientInterceptor` approach would require proto `toString()` or custom marshalling to produce readable log output. The trade-off is that AOP misses low-level transport errors (e.g. connection refused before the stub is called) — those surface as exceptions caught by the aspect's catch block, so nothing is silently lost.
+
+### Kafka payload logging
+
+**Outbound (`payment.submitted`):** implement `ProducerInterceptor<String, PaymentSubmittedEvent>` and register it via `spring.kafka.producer.properties.interceptor.classes`. The interceptor receives the fully serialized `ProducerRecord` before send — log topic, partition key, and (at DEBUG) the JSON payload via `LogRedactor`.
+
+**Inbound (`payment.result`):** implement a Spring Kafka `RecordInterceptor<String, PaymentResultEvent>` and register it on the `ConcurrentKafkaListenerContainerFactory`. Logs topic, partition, offset, and (at DEBUG) payload on entry; logs outcome on exit.
+
+Lighter alternative: a `log.info` at the top of `PaymentResultHandler.handle(...)` is perfectly readable and already has MDC context. Prefer the `RecordInterceptor` approach for symmetry with the producer side — both Kafka boundaries are logged at the same layer — but if the plan is executed and the interceptor adds friction, the inline log is an acceptable simplification.
+
+### Redaction policy
+
+This service processes payment amounts and card metadata. The `LogRedactor` utility enforces the following rules in one place so every aspect and interceptor calls `LogRedactor.sanitise(dto)` rather than scattering field checks:
+
+| Field | Rule |
+|---|---|
+| PAN / full account number | Mask all but last 4 digits: `****-****-****-1234`. Today's DTOs do not carry PAN — this rule exists to prevent regression if PAN is added later. |
+| CVV / CVC | Never log; replace with `[REDACTED]`. |
+| `cardNetwork` | Loggable as-is (VISA, MASTERCARD, etc. — not sensitive). |
+| `amount` + `currency` | Loggable — needed for support and incident investigation. |
+| `merchantId` | Loggable — already in MDC. |
+| `Idempotency-Key` | Log as-is — opaque token, not PII. |
+| `lockedRate` | Loggable — FX rate, no PII. |
+| `fraudReason` | Log at DEBUG only — may contain model feature names that are operationally sensitive. |
+
+`LogRedactor` works against the DTO/event `record` types, not raw JSON strings, so it is applied before serialization — no regex scrubbing of already-serialised strings.
+
+### Log levels and the `logging.payload.enabled` toggle
+
+```yaml
+logging:
+  level:
+    hp.microservice.demo.transaction_service.logging: INFO
+  payload:
+    enabled: false
+```
+
+- `INFO` — method entry/exit, latency, outcome. Always on.
+- `DEBUG` — full (redacted) request and response bodies. Enabled by setting `logging.payload.enabled: true` or raising the logger level to `DEBUG`. Default is `false` so production runs lean without log-volume risk.
+- All aspects short-circuit the payload serialization path with an `if (log.isDebugEnabled() && payloadLoggingEnabled)` guard — serializing a proto message or a DTO to string on every request at INFO with no consumer is wasteful even with virtual threads.
 
 ---
 
@@ -713,6 +1422,8 @@ gRPC calls: pass `traceId` as gRPC metadata header `x-trace-id` via a `ClientInt
 | `FxServiceTest` | Rate lock happy path, timeout |
 | `OutboxRelayServiceTest` | Polling logic, retry_count increment, FAILED cutoff |
 | `PaymentResultHandlerTest` | State machine advancement, illegal transition guard, manual ack |
+| `RestLoggingAspectTest` | `LogRedactor` is invoked; PAN present in DTO is masked before log output |
+| `GrpcClientLoggingAspectTest` | `LogRedactor` is invoked; circuit-open outcome logged as distinct case from `StatusRuntimeException` |
 
 Use `@ExtendWith(MockitoExtension.class)`. Mock repository interfaces and gRPC stubs.
 
@@ -721,12 +1432,25 @@ Use `@ExtendWith(MockitoExtension.class)`. Mock repository interfaces and gRPC s
 - `TransactionRepositoryTest` — idempotency key unique constraint enforcement, merchant filter query
 - `OutboxRepositoryTest` — PENDING query, ordering guarantee
 
-Use Testcontainers `PostgreSQLContainer` with `@DataJpaTest`. Flyway migrations run automatically against the container — this tests migrations too.
+Use Testcontainers `PostgreSQLContainer` with `@DataJpaTest`. `@DataJpaTest` replaces the datasource with H2 by default and disables Flyway — three additional annotations are required to make it work with a real Postgres container and real migrations:
+
+1. `@AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)` — prevents H2 substitution and keeps the datasource pointed at the Testcontainers Postgres.
+2. `@DynamicPropertySource` — injects the container's JDBC URL, username, and password into the datasource config at test startup.
+3. `@ImportAutoConfiguration(FlywayAutoConfiguration.class)` — re-enables Flyway in the test slice (it is excluded by default in `@DataJpaTest`).
+
+With all three in place, Flyway migrations run against the real container and the schema matches production exactly.
 
 ### REST controller slice tests (@WebMvcTest)
 
 - `PaymentControllerTest` — JWT present/absent, role enforcement, `@Valid` rejection, `ProblemDetail` shape
-- Use `@WithMockJwt` (from `spring-security-test`) with a custom `realm_access.roles` claim structure matching the production converter
+- Use `SecurityMockMvcRequestPostProcessors.jwt()` from `spring-security-test` to inject a mock JWT with the `realm_access.roles` claim matching the production converter:
+
+```java
+mockMvc.perform(post("/api/v1/payments")
+    .with(jwt().jwt(j -> j.claim("realm_access", Map.of("roles", List.of("MERCHANT"))))))
+```
+
+`@WithMockJwt` does not exist in `spring-security-test`. The correct API is the `jwt()` request post-processor shown above.
 
 ### Integration tests (full Spring context + Testcontainers)
 
@@ -785,7 +1509,7 @@ Note: `imagePullPolicy: Never` in the deployment means the rollout will use what
 
 | Dependency | Status check | Blocker? |
 |---|---|---|
-| Postgres `paymentdb` database | `kubectl exec -n data postgres-postgresql-0 -- psql -U postgres -c "\l"` | Hard blocker — datasource URL hardcoded |
+| Postgres `paymentdb` database | Verify: `kubectl exec -n data postgres-postgresql-0 -- psql -U postgres -c "\l"`. Create if absent: `kubectl exec -n data postgres-postgresql-0 -- psql -U postgres -c "CREATE DATABASE paymentdb;"` | Hard blocker — datasource URL hardcoded |
 | `transaction-service-secret` with `DB_PASSWORD` | `kubectl get secret transaction-service-secret -n app` | Hard blocker |
 | Kafka broker running | `kubectl get pods -n data -l app.kubernetes.io/name=kafka` | Hard blocker — `KafkaTemplate` fails context load if broker unreachable at startup (configure `spring.kafka.producer.properties.reconnect.backoff.max.ms` to allow retry and avoid hard startup failure) |
 | Kafka topics created | `kafka-topics.sh --list ...` | Soft blocker — topics auto-create if `auto.create.topics.enable=true`, but it's better to pre-create with correct partition count |
@@ -815,23 +1539,25 @@ For early development, deploy stub gRPC servers for fraud and fx (returning hard
 kubectl exec -n data kafka-0 -- kafka-topics.sh `
   --bootstrap-server localhost:9092 `
   --create --if-not-exists `
-  --topic payment.submitted --partitions 6 --replication-factor 1
+  --topic payment.submitted --partitions 3 --replication-factor 1
 
 kubectl exec -n data kafka-0 -- kafka-topics.sh `
   --bootstrap-server localhost:9092 `
   --create --if-not-exists `
-  --topic payment.result --partitions 6 --replication-factor 1
+  --topic payment.result --partitions 3 --replication-factor 1
 
 kubectl exec -n data kafka-0 -- kafka-topics.sh `
   --bootstrap-server localhost:9092 `
   --create --if-not-exists `
-  --topic payment.retry --partitions 6 --replication-factor 1
+  --topic payment.retry --partitions 3 --replication-factor 1
 
 kubectl exec -n data kafka-0 -- kafka-topics.sh `
   --bootstrap-server localhost:9092 `
   --create --if-not-exists `
   --topic payment.dlq --partitions 1 --replication-factor 1
 ```
+
+Note: 3 partitions matches the existing `kafka.yaml` init Job. If the init Job has already run and created these topics at a different partition count, use `--alter` to increase (Kafka does not support decreasing partition counts).
 
 ---
 
@@ -855,8 +1581,8 @@ kubectl exec -n data kafka-0 -- kafka-topics.sh `
 
 | Phase | Task | Verification |
 |---|---|---|
-| **1** | Update `build.gradle` + `settings.gradle` with all dependencies | `.\gradlew.bat dependencies` resolves cleanly |
-| **2** | Create package skeleton (empty classes, no logic) | `.\gradlew.bat compileJava -x test` succeeds |
+| **1** | Update `build.gradle` with all dependencies; create stub `application.yml` with `issuer-uri` and `datasource` placeholders (required before Phase 5 tests can load a Spring context) | `.\gradlew.bat :services:transaction-service:dependencies` from root resolves cleanly |
+| **2 / 2.1** | Create package skeleton (empty classes, no logic) using the Phase 2 layout, including all interfaces and abstract classes introduced in Phase 2.1 (`FraudGateway`, `FxGateway`, `TransactionStateHandler`, `PaymentValidationStep`, `AbstractOutboxRelayService`, `EventPublisher`, `TransactionOutboxFactory`, `AuditLogListener`) | `.\gradlew.bat :services:transaction-service:compileJava -x test` from root succeeds |
 | **3** | Write V1–V4 Flyway migrations | `@DataJpaTest` slice starts, schema created |
 | **4** | Implement `Transaction`, `TransactionStatus`, `TransactionOutbox`, `AuditLog`, `RoutingRule` entities | `@DataJpaTest` for `TransactionRepository` passes |
 | **5** | Implement `PaymentRequest`/`PaymentResponse` DTOs + `PaymentController` shell (no service logic) | `@WebMvcTest` 401 on unauthenticated, 400 on invalid body |
@@ -866,8 +1592,9 @@ kubectl exec -n data kafka-0 -- kafka-topics.sh `
 | **9** | Implement `KafkaProducerConfig` + `OutboxRelayService` (scheduler + KafkaTemplate) | `OutboxRelayServiceTest` passes; integration test shows `payment.submitted` on Kafka |
 | **10** | Implement `KafkaConsumerConfig` + `PaymentResultHandler` | Integration test: publish `payment.result` → transaction reaches `SUCCEEDED` |
 | **11** | Implement `PaymentControllerAdvice` (ProblemDetail error mapping) | Unit test: fraud rejection returns `422` with extension field |
-| **12** | Write `application.yml`, delete `application.properties`, add `logback-spring.xml` | App starts locally with `.\gradlew.bat bootRun` |
+| **12a** | Expand stub `application.yml` to full version (Phase 11), delete `application.properties`, add `logback-spring.xml` | App starts locally with `.\gradlew.bat :services:transaction-service:bootRun` |
+| **12b** | Implement `logging/` package: `LogRedactor`, `RestLoggingAspect`, `GrpcClientLoggingAspect`, Kafka `ProducerInterceptor` + `RecordInterceptor` | JSON log line for a sample `POST /api/v1/payments` shows `latencyMs` field; at `DEBUG` level, `request` and `response` fields appear with PAN masked to `****-****-****-1234` if present |
 | **13** | Add MDC filter (`OncePerRequestFilter`) + gRPC client interceptor | Log output shows `traceId` and `transactionId` fields in JSON |
-| **14** | Write full integration test suite (`PaymentSagaIntegrationTest`) | `.\gradlew.bat test` green |
+| **14** | Write full integration test suite (`PaymentSagaIntegrationTest`) | `.\gradlew.bat :services:transaction-service:test` from root green |
 | **15** | Write `Dockerfile`, build image, import into k3d | Pod comes up `Running` in `app` namespace |
 | **16** | End-to-end smoke test via api-gateway → transaction-service | `Invoke-RestMethod` with JWT → transaction `RECEIVED`, outbox relay publishes to `payment.submitted` |
