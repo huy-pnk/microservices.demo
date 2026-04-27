@@ -1,23 +1,23 @@
 {
   "info": {
     "name": "api-gateway smoke tests",
-    "description": "End-to-end smoke tests for the payment api-gateway running in the local k3d cluster.\n\n## Prerequisites\n\n1. **Hosts file** — add to `C:\\Windows\\System32\\drivers\\etc\\hosts`:\n   ```\n   127.0.0.1   api.k3d.test\n   127.0.0.1   keycloak.localhost\n   ```\n2. **Cluster healthy** — `kubectl get pods -n app -l app=api-gateway` shows `1/1 Running`.\n3. **Keycloak realm `payments` exists** with:\n   - Client `payments-gateway` (confidential, *Direct access grants* enabled)\n   - Realm role `MERCHANT`\n   - User `acme` (password `acme`) with `MERCHANT` role assigned\n4. **Set the `client_secret` collection variable** to the secret from Keycloak → Clients → payments-gateway → Credentials.\n\n## Run order\n\nExecute requests top-to-bottom (or use the Collection Runner). Each request's *Tests* tab asserts the expected status. The `Get token` request stores the JWT in `access_token`; the `First valid POST` request stores a fresh `idempotency_key` so the replay tests reuse it.\n\n## Notes\n\n- Step 5 (`First valid POST`) returns **404** because `transaction-service` is still a skeleton with no controllers. The 404 came *from transaction-service*, which proves the gateway forwarded successfully — verify with `kubectl logs -n app -l app=transaction-service --tail=20`.\n- The rate-limiter burst test (Step 8) is best run from the Collection Runner with iterations=200; expect a mix of 404 and 429.",
+    "description": "End-to-end smoke tests for the payment api-gateway running in the local k3d cluster.\n\n## Prerequisites\n\n1. **Hosts file** — add to `C:\\Windows\\System32\\drivers\\etc\\hosts`:\n   ```\n   127.0.0.1   api.payment.test   keycloak.localhost\n   ```\n2. **Cluster healthy** — `kubectl get pods -n app -l app=api-gateway` shows `1/1 Running`.\n3. **Keycloak realm `payments` exists** with:\n   - Client `payments-gateway` (confidential, *Direct access grants* enabled)\n   - Realm role `MERCHANT`\n   - User `acme` (password `acme`) with `MERCHANT` role assigned\n4. **Set the `client_secret` collection variable** to the secret from Keycloak → Clients → payments-gateway → Credentials.\n5. **SSL certificate verification** — Traefik uses a self-signed cert. Disable SSL verification in Postman: Settings → General → SSL certificate verification → **OFF**.\n\n## Run order\n\nExecute requests top-to-bottom (or use the Collection Runner). Each request's *Tests* tab asserts the expected status. The `Get token` request stores the JWT in `access_token`; the `First valid POST` request stores a fresh `idempotency_key` so the replay tests reuse it.\n\n## Notes\n\n- Step 5 (`First valid POST`) returns **404** because `transaction-service` is still a skeleton with no controllers. The 404 came *from transaction-service*, which proves the gateway forwarded successfully — verify with `kubectl logs -n app -l app=transaction-service --tail=20`.\n- The rate-limiter burst test (Step 8) is best run from the Collection Runner with iterations=200; expect a mix of 404 and 429.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
     {
       "key": "gateway_base_url",
-      "value": "http://localhost:8090",
+      "value": "https://api.payment.test:8443",
       "type": "string"
     },
     {
       "key": "gateway_host_header",
-      "value": "api.k3d.test",
+      "value": "api.payment.test",
       "type": "string"
     },
     {
       "key": "keycloak_base_url",
-      "value": "http://keycloak.localhost:8090",
+      "value": "https://keycloak.localhost:8443",
       "type": "string"
     },
     {
@@ -75,9 +75,7 @@
       ],
       "request": {
         "method": "GET",
-        "header": [
-          { "key": "Host", "value": "{{gateway_host_header}}" }
-        ],
+        "header": [],
         "url": {
           "raw": "{{gateway_base_url}}/actuator/health",
           "host": ["{{gateway_base_url}}"],
@@ -101,7 +99,6 @@
       "request": {
         "method": "POST",
         "header": [
-          { "key": "Host", "value": "{{gateway_host_header}}" },
           { "key": "Content-Type", "value": "application/json" }
         ],
         "body": {
@@ -170,7 +167,6 @@
       "request": {
         "method": "POST",
         "header": [
-          { "key": "Host", "value": "{{gateway_host_header}}" },
           { "key": "Authorization", "value": "Bearer {{access_token}}" },
           { "key": "Content-Type", "value": "application/json" }
         ],
@@ -220,7 +216,6 @@
       "request": {
         "method": "POST",
         "header": [
-          { "key": "Host", "value": "{{gateway_host_header}}" },
           { "key": "Authorization", "value": "Bearer {{access_token}}" },
           { "key": "Idempotency-Key", "value": "{{idempotency_key}}" },
           { "key": "Content-Type", "value": "application/json" }
@@ -259,7 +254,6 @@
       "request": {
         "method": "POST",
         "header": [
-          { "key": "Host", "value": "{{gateway_host_header}}" },
           { "key": "Authorization", "value": "Bearer {{access_token}}" },
           { "key": "Idempotency-Key", "value": "{{idempotency_key}}" },
           { "key": "Content-Type", "value": "application/json" }
@@ -291,7 +285,6 @@
       "request": {
         "method": "POST",
         "header": [
-          { "key": "Host", "value": "{{gateway_host_header}}" },
           { "key": "Authorization", "value": "Bearer {{access_token}}" },
           { "key": "Idempotency-Key", "value": "{{idempotency_key}}" },
           { "key": "Content-Type", "value": "application/json" }
@@ -341,7 +334,6 @@
       "request": {
         "method": "POST",
         "header": [
-          { "key": "Host", "value": "{{gateway_host_header}}" },
           { "key": "Authorization", "value": "Bearer {{access_token}}" },
           { "key": "Idempotency-Key", "value": "{{burst_key}}" },
           { "key": "Content-Type", "value": "application/json" }

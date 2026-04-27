@@ -14,7 +14,7 @@ spring:
       resourceserver:
         jwt:
           issuer-uri: ${KEYCLOAK_ISSUER_URI:http://keycloak.localhost:8090/realms/payments}
-          jwk-set-uri: ${KEYCLOAK_ISSUER_URI:http://keycloak.localhost:8090/realms/payments}/protocol/openid-connect/certs
+          jwk-set-uri: ${KEYCLOAK_JWK_SET_URI:http://keycloak.localhost:8090/realms/payments/protocol/openid-connect/certs}
 
   data:
     redis:

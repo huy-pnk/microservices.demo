@@ -18,19 +18,24 @@ spec:
       containers:
         - name: api-gateway
           image: micro/api-gateway:dev
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Never
           ports:
             - containerPort: 8080
             - containerPort: 5005
               name: jdwp
           env:
             - name: JAVA_TOOL_OPTIONS
-              value: "-XX:MaxRAMPercentage=50 -XX:InitialRAMPercentage=25 -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005 -Dspring.security.oauth2.resourceserver.jwt.jwk-set-uri=http://keycloak.auth.svc.cluster.local/realms/payments/protocol/openid-connect/certs"
+              value: "-XX:MaxRAMPercentage=50 -XX:InitialRAMPercentage=25 -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005"
             - name: KEYCLOAK_ISSUER_URI
               valueFrom:
                 configMapKeyRef:
                   name: api-gateway-config
                   key: KEYCLOAK_ISSUER_URI
+            - name: KEYCLOAK_JWK_SET_URI
+              valueFrom:
+                configMapKeyRef:
+                  name: api-gateway-config
+                  key: KEYCLOAK_JWK_SET_URI
             - name: TRANSACTION_SERVICE_URL
               valueFrom:
                 configMapKeyRef:
@@ -46,6 +51,11 @@ spec:
                 configMapKeyRef:
                   name: api-gateway-config
                   key: REDIS_PORT
+            # Trust X-Forwarded-Proto/Port headers from Traefik so Spring Boot
+            # builds correct redirect URLs (https://...) instead of redirecting
+            # http→https in an infinite loop when TLS is terminated at the ingress.
+            - name: SERVER_FORWARD_HEADERS_STRATEGY
+              value: "framework"
           readinessProbe:
             httpGet:
               path: /actuator/health/readiness

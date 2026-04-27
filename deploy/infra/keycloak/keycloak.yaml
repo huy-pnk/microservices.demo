@@ -47,10 +47,14 @@ spec:
                   name: keycloak-secret
                   key: db-password
             - name: KC_HOSTNAME
-              value: "keycloak.localhost"
+              # Must be the full HTTPS URL — this becomes the `iss` claim in tokens.
+              # All services validating JWTs must fetch JWKS from this issuer URL.
+              value: "https://keycloak.localhost:8443"
             - name: KC_HOSTNAME_STRICT
               value: "false"
             - name: KC_HTTP_ENABLED
+              # Keep HTTP enabled so liveness/readiness probes (port 8080) still work
+              # inside the pod. TLS is terminated at Traefik, not inside Keycloak.
               value: "true"
             - name: KC_PROXY_HEADERS
               value: "xforwarded"
@@ -83,8 +87,15 @@ metadata:
   name: keycloak
   namespace: auth
   annotations:
-    traefik.ingress.kubernetes.io/router.entrypoints: web
+    # Route only on the HTTPS entrypoint.
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
 spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - keycloak.localhost
+      # Secret must exist in the same namespace as this Ingress (auth).
+      secretName: local-tls
   rules:
     - host: keycloak.localhost
       http:

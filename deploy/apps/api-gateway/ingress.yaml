@@ -4,11 +4,20 @@ metadata:
   name: api-gateway
   namespace: app
   annotations:
-    traefik.ingress.kubernetes.io/router.entrypoints: web
+    # Route only on the HTTPS (websecure) entrypoint.
+    # The redirect middleware lives on the companion HTTP Ingress (https-redirect.yaml),
+    # not here — attaching it to the HTTPS Ingress causes a 301 loop on port 8443.
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
 spec:
   ingressClassName: traefik
+  tls:
+    - hosts:
+        - api.payment.test
+      # Secret must exist in the same namespace as this Ingress (app).
+      # Apply with: kubectl apply -f deploy/infra/certs/tls-secret.yaml
+      secretName: local-tls
   rules:
-    - host: api.k3d.test
+    - host: api.payment.test
       http:
         paths:
           - path: /
