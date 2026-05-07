@@ -20,6 +20,11 @@ resources:
 
 esJavaOpts: "-Xmx512m -Xms512m"
 
+# Single-node cluster: status will be "yellow" (one unassigned replica per index)
+# because there is no second node to host replica shards.
+# Downgrade the readiness probe from green to yellow so the pod reaches Ready state.
+clusterHealthCheckParams: "wait_for_status=yellow&timeout=1s"
+
 persistence:
   enabled: true
   size: 5Gi

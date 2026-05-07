@@ -16,7 +16,6 @@ logstashPipeline:
       if [message] =~ /^\{/ {
         json {
           source => "message"
-          target => "parsed"
           skip_on_invalid_json => true
         }
       }
@@ -44,7 +43,7 @@ resources:
     cpu: 500m
     memory: 768Mi
 
-logstashJavaOpts: "-Xmx256m -Xms256m"
+logstashJavaOpts: "-Xmx512m -Xms512m"
 
 persistence:
   enabled: false
