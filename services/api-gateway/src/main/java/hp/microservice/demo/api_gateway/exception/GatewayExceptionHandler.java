@@ -1,5 +1,7 @@
 package hp.microservice.demo.api_gateway.exception;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.boot.web.reactive.error.ErrorWebExceptionHandler;
 import org.springframework.core.annotation.Order;
 import org.springframework.core.io.buffer.DataBuffer;
@@ -20,6 +22,8 @@ import java.time.Instant;
 @Order(-2)
 public class GatewayExceptionHandler implements ErrorWebExceptionHandler {
 
+    private static final Logger log = LoggerFactory.getLogger(GatewayExceptionHandler.class);
+
     @Override
     public Mono<Void> handle(ServerWebExchange exchange, Throwable ex) {
         ServerHttpResponse response = exchange.getResponse();
@@ -29,10 +33,13 @@ public class GatewayExceptionHandler implements ErrorWebExceptionHandler {
         }
 
         HttpStatus status = resolveStatus(ex);
+        String path = exchange.getRequest().getPath().value();
+
+        log.error("Gateway error handling request {} -> {} {}: {}",
+                path, status.value(), status.getReasonPhrase(), ex.toString(), ex);
+
         response.setStatusCode(status);
         response.getHeaders().setContentType(MediaType.APPLICATION_JSON);
-
-        String path = exchange.getRequest().getPath().value();
         String body = buildErrorBody(status, ex.getMessage(), path);
         byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
         DataBuffer buffer = response.bufferFactory().wrap(bytes);
