@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: api-gateway-config
+  namespace: app
+data:
+  # HTTPS issuer URI — must match KC_HOSTNAME in keycloak.yaml so the `iss` claim
+  # in tokens equals the URL the gateway fetches JWKS from.
+  # External port 8443 is the host-side mapping to Traefik's websecure entrypoint.
+  KEYCLOAK_ISSUER_URI: "https://keycloak.localhost:8443/realms/payments"
+  # Tell Spring Boot to trust X-Forwarded-Proto/Port headers from Traefik.
+  # Without this, Netty sees X-Forwarded-Proto=https, decides the request
+  # came in on HTTP, and issues a 301 redirect to the same URL — infinite loop.
+  SERVER_FORWARD_HEADERS_STRATEGY: "framework"
+  TRANSACTION_SERVICE_URL: "http://transaction-service.app.svc.cluster.local:8080"
+  REDIS_HOST: "redis-master.data.svc.cluster.local"
+  REDIS_PORT: "6379"
+  KEYCLOAK_JWK_SET_URI: "http://keycloak.auth.svc.cluster.local/realms/payments/protocol/openid-connect/certs"

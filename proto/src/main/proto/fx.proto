@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package fx;
+
+option java_package = "hp.microservice.demo.proto.fx";
+option java_outer_classname = "FxProto";
+option java_multiple_files = true;
+
+service FxService {
+  rpc GetRate(RateRequest)          returns (RateResponse);
+  rpc LockRate(LockRateRequest)     returns (LockRateResponse);
+}
+
+message RateRequest {
+  string from_currency = 1;
+  string to_currency   = 2;
+}
+
+message RateResponse {
+  string from_currency = 1;
+  string to_currency   = 2;
+  double rate          = 3;
+}
+
+message LockRateRequest {
+  string transaction_id = 1;
+  string from_currency  = 2;
+  string to_currency    = 3;
+}
+
+message LockRateResponse {
+  string transaction_id = 1;
+  double locked_rate    = 2;
+  int64  expires_at     = 3;
+}

@@ -6,10 +6,7 @@ primary:
   initdb:
     scripts:
       init-dbs.sql: |
-        CREATE DATABASE userdb;
-        CREATE DATABASE productdb;
-        CREATE DATABASE orderdb;
-        CREATE DATABASE inventorydb;
+        CREATE DATABASE paymentdb;
         CREATE DATABASE keycloakdb;
   persistence:
     enabled: true

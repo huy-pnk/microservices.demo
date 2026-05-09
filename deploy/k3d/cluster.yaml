@@ -3,7 +3,7 @@ kind: Simple
 metadata:
   name: micro
 servers: 1
-agents: 2
+agents: 1
 ports:
   - port: "8090:80"
     nodeFilters:
