@@ -127,12 +127,10 @@ web/
     PaymentControllerAdvice      # @RestControllerAdvice — maps domain exceptions to ProblemDetail (RFC 9457)
 
 service/
-    PaymentService               # Saga orchestration only — delegates to SagaOrchestrator, FraudGateway, FxGateway
+    PaymentService               # Entry point only — persists transaction, delegates to SagaOrchestrator
     SagaOrchestrator             # Holds Map<TransactionStatus, TransactionStateHandler>; dispatches state transitions
     FraudGateway                 # interface — domain contract for fraud evaluation (DIP)
     FxGateway                    # interface — domain contract for FX rate locking (DIP)
-    FraudCheckService            # implements FraudGateway — adapter over FraudServiceGrpc stub
-    FxService                    # implements FxGateway — adapter over FxServiceGrpc stub
     RoutingService               # Encapsulates RoutingRule lookup logic (extracted from PaymentService)
     OutboxRelayService           # extends AbstractOutboxRelayService<TransactionOutbox> — Kafka relay
     WebhookRelayService          # extends AbstractOutboxRelayService<TransactionOutbox> — HTTP POST relay (Phase 10)
@@ -140,6 +138,10 @@ service/
     PaymentResultHandler         # @KafkaListener on payment.result — advances state machine
     EventPublisher               # interface — abstracts KafkaTemplate from OutboxRelayService (DIP)
     KafkaEventPublisher          # implements EventPublisher — wraps KafkaTemplate
+
+service/adapter/
+    GrpcFraudGateway             # implements FraudGateway — gRPC adapter over FraudServiceGrpc stub; @CircuitBreaker + @Retry
+    GrpcFxGateway                # implements FxGateway — gRPC adapter over FxServiceGrpc stub; @CircuitBreaker + @Retry
 
 service/validation/
     PaymentValidationStep        # interface — Chain of Responsibility contract
@@ -160,7 +162,7 @@ repository/
     TransactionReadRepository    # fragment — query methods used by controllers/read paths
     TransactionWriteRepository   # fragment — mutation methods used by PaymentService
     OutboxRepository             # JPA repository for TransactionOutbox entity
-    OutboxRelayRepository        # fragment — findPendingBatch, markSent, incrementRetry
+    OutboxRelayRepository        # fragment — findPendingBatch, markSent, incrementRetry, markFailed
     AuditLogRepository           # JPA repository for AuditLog entity
     RoutingRulesRepository       # JPA repository for RoutingRule entity
 
@@ -190,7 +192,7 @@ factory/
 logging/
     AuditLogListener             # @TransactionalEventListener — writes AuditLog on status change
     RestLoggingAspect            # @Aspect — REST controller entry/exit
-    GrpcClientLoggingAspect      # @Aspect — FraudCheckService / FxService entry/exit
+    GrpcClientLoggingAspect      # @Aspect — GrpcFraudGateway / GrpcFxGateway entry/exit
     LogRedactor                  # Utility — centralised field-masking policy
 
 web/dto/
@@ -305,10 +307,10 @@ New sensitive fields are added in `application.yml` under `logging.redaction.fie
 
 ### SOLID: Liskov Substitution — `FraudGateway` and `FxGateway`
 
-`FraudCheckService` and `FxService` must honour the same contract regardless of whether a test substitutes a mock or the real gRPC adapter is in use. The contract is: _always return a typed domain result or throw a typed domain exception — never let `StatusRuntimeException` escape_.
+`GrpcFraudGateway` and `GrpcFxGateway` must honour the same contract as any mock substitute regardless of whether a test or the real gRPC adapter is in use. The contract is: _always return a typed domain result or throw a typed domain exception — never let `StatusRuntimeException` escape_.
 
 ```java
-// In domain/ — callers depend only on these
+// In service/ — callers depend only on these interfaces, never on adapter implementations
 interface FraudGateway {
     FraudResult evaluate(FraudRequest request);  // throws FraudServiceUnavailableException
 }
@@ -318,7 +320,7 @@ interface FxGateway {
 }
 ```
 
-Any implementation that leaks `StatusRuntimeException` to callers violates LSP because the caller then must know which concrete implementation it has. `GrpcFraudGateway` and `GrpcFxGateway` must catch all `StatusRuntimeException` instances internally and re-raise as the typed domain exception. A mock in `PaymentServiceTest` that never throws `StatusRuntimeException` is then a valid substitute — the test passes, and the contract holds.
+Any implementation that leaks `StatusRuntimeException` to callers violates LSP because the caller then must know which concrete implementation it has. `GrpcFraudGateway` and `GrpcFxGateway` in `service/adapter/` must catch all `StatusRuntimeException` instances internally and re-raise as the typed domain exception. A mock in `FraudCheckingHandlerTest` that never throws `StatusRuntimeException` is then a valid substitute — the test passes, and the contract holds.
 
 ---
 
@@ -363,31 +365,36 @@ public interface OutboxRepository
                 OutboxRelayRepository {}
 ```
 
-`OutboxRelayService` is injected with `OutboxRelayRepository` — the narrowest possible interface. This makes the test trivial: mock only three methods.
+`OutboxRelayService` is injected with `OutboxRelayRepository` — the narrowest possible interface. This makes the test trivial: mock only four methods.
 
 ---
 
-### SOLID: Dependency Inversion — `PaymentService` gRPC dependencies
+### SOLID: Dependency Inversion — state handler gRPC dependencies
 
-`PaymentService` must not depend on `FraudCheckService` or `FxService` concretely. It depends on `FraudGateway` and `FxGateway` interfaces:
+No class in the service layer may depend on `GrpcFraudGateway` or `GrpcFxGateway` concretely. `FraudCheckingHandler` and `FxLockingHandler` each depend on the `FraudGateway` and `FxGateway` interfaces respectively. `PaymentService` depends only on `SagaOrchestrator` (as shown in the SRP section) — it has no direct dependency on either gateway:
 
 ```java
-@Service
-@Transactional
-public class PaymentService {
+@Component
+public class FraudCheckingHandler implements TransactionStateHandler {
 
-    private final FraudGateway fraudGateway;
-    private final FxGateway fxGateway;
-    // ...
+    private final FraudGateway fraudGateway; // interface — never GrpcFraudGateway
 
-    public PaymentService(FraudGateway fraudGateway, FxGateway fxGateway, ...) {
+    public FraudCheckingHandler(FraudGateway fraudGateway) {
         this.fraudGateway = fraudGateway;
-        this.fxGateway = fxGateway;
+    }
+
+    @Override
+    public TransactionStatus handles() { return TransactionStatus.FRAUD_CHECKING; }
+
+    @Override
+    public Transaction advance(Transaction tx, SagaContext ctx) {
+        FraudResult result = fraudGateway.evaluate(FraudRequest.from(tx));
+        // ... state transition logic
     }
 }
 ```
 
-`PaymentServiceTest` then injects `mock(FraudGateway.class)` — no gRPC stub, no `grpc-testing` overhead. The integration test wires `GrpcFraudGateway` via the Spring context.
+`PaymentServiceTest` injects `mock(SagaOrchestrator.class)` — it has no knowledge of either gateway. Handler-level unit tests (`FraudCheckingHandlerTest`) inject `mock(FraudGateway.class)` — no gRPC stub, no `grpc-testing` overhead. The integration test wires `GrpcFraudGateway` via the Spring context.
 
 ---
 
@@ -649,7 +656,7 @@ public interface FraudGateway {
     FraudResult evaluate(FraudRequest request); // throws FraudServiceUnavailableException
 }
 
-// In service/ — gRPC adapter
+// In service/adapter/ — gRPC adapter; proto types never leave this class
 public class GrpcFraudGateway implements FraudGateway {
 
     private final FraudServiceGrpc.FraudServiceBlockingStub stub;
@@ -685,18 +692,18 @@ public class GrpcFraudGateway implements FraudGateway {
 }
 ```
 
-Apply the same pattern for `GrpcFxGateway implements FxGateway`. Domain value objects (`FraudRequest`, `FraudResult`, `FraudVerdict`, `FxRateRequest`, `FxRateResult`) live in `domain/`. The proto module is imported only by the two adapter classes.
+Apply the same pattern for `GrpcFxGateway implements FxGateway`. Domain value objects (`FraudRequest`, `FraudResult`, `FraudVerdict`, `FxRateRequest`, `FxRateResult`) live in `domain/`. Both adapter classes (`GrpcFraudGateway`, `GrpcFxGateway`) live in `service/adapter/`. The proto module is imported only by these two adapter classes — nowhere else in the service layer.
 
 ---
 
 ### Pattern: Observer / Event — Audit log decoupling
 
-`PaymentService` publishing `TransactionStatusChangedEvent` via `ApplicationEventPublisher` removes the direct dependency on `AuditLogRepository`:
+Each `TransactionStateHandler` publishes `TransactionStatusChangedEvent` via `ApplicationEventPublisher` after setting the new status on the transaction. This removes the direct dependency on `AuditLogRepository` from every handler and from `SagaOrchestrator`:
 
 ```java
-// Published inside PaymentService (or inside each TransactionStateHandler) on every state change:
+// Published inside each TransactionStateHandler after every status transition:
 eventPublisher.publishEvent(
-    new TransactionStatusChangedEvent(tx.getId(), oldStatus, newStatus, actorId));
+    new TransactionStatusChangedEvent(tx.getId(), oldStatus, tx.getStatus(), actorId));
 ```
 
 ```java
@@ -731,7 +738,7 @@ A future listener (e.g., a Micrometer counter increment) that does not need DB d
 
 ### Pattern: Decorator — Resilience4j wrapping
 
-The plan describes manually wrapping stub calls with `CircuitBreaker.decorateCheckedSupplier`. Annotation-based Resilience4j is the better choice for this Spring Boot service: it removes boilerplate from `GrpcFraudGateway` and `GrpcFxGateway` and integrates automatically with Micrometer metrics via `resilience4j-micrometer`.
+Annotation-based Resilience4j is used in place of the programmatic `CircuitBreaker.decorateCheckedSupplier` approach. Annotations remove boilerplate from `GrpcFraudGateway` and `GrpcFxGateway` and integrate automatically with Micrometer metrics via `resilience4j-micrometer`. Both adapter classes live in `service/adapter/`.
 
 ```java
 @CircuitBreaker(name = "fraud-service", fallbackMethod = "fallback")
@@ -749,7 +756,7 @@ The `fallback` method must accept the same parameter types as the annotated meth
 
 `GrpcClientConfig` becomes minimal — it only registers the `@GrpcClient`-injected stubs as beans and provides the adapter implementations. No manual `CircuitBreaker.decorateCheckedSupplier` chains.
 
-**Trade-off acknowledged:** annotation-based Resilience4j requires Spring AOP proxying, so calls from within the same bean bypass the circuit breaker. `GrpcFraudGateway.evaluate` is only ever called from `SagaOrchestrator` (a different bean), so this is not an issue here. If self-invocation were needed, inject `self` or use the programmatic API — but that situation does not arise in this design.
+**Trade-off acknowledged:** annotation-based Resilience4j requires Spring AOP proxying, so calls from within the same bean bypass the circuit breaker. `GrpcFraudGateway.evaluate` is only ever called from `FraudCheckingHandler` (a different bean), and `GrpcFxGateway.lockRate` from `FxLockingHandler` (also a different bean) — so self-invocation is not an issue here. If self-invocation were needed, inject `self` or use the programmatic API — but that situation does not arise in this design.
 
 ---
 
@@ -955,13 +962,13 @@ grpc:
       negotiation-type: plaintext
 ```
 
-`FraudCheckService` and `FxService` classes in `service/` inject `@GrpcClient("fraud-service") FraudServiceGrpc.FraudServiceBlockingStub fraudStub` (and similarly for fx).
+`GrpcFraudGateway` and `GrpcFxGateway` in `service/adapter/` inject `@GrpcClient("fraud-service") FraudServiceGrpc.FraudServiceBlockingStub fraudStub` (and similarly for fx). The stubs are injected by `net.devh:grpc-client-spring-boot-starter` via the channel configuration above.
 
 ### Resilience4j policy
 
-Both stubs are I/O calls to external services — must be wrapped.
+Both adapters make I/O calls to external services — must be wrapped with circuit breaker and retry.
 
-**`GrpcClientConfig`** defines two `CircuitBreakerConfig` beans (one for fraud, one for fx):
+Use annotation-based Resilience4j (see Phase 2.1 Pattern: Decorator). `GrpcClientConfig` does **not** define manual `CircuitBreaker.decorateCheckedSupplier` chains — circuit breaker and retry behaviour is declared via `@CircuitBreaker` + `@Retry` annotations on `GrpcFraudGateway.evaluate` and `GrpcFxGateway.lockRate`. The circuit breaker and retry instances are configured in `application.yml` under `resilience4j.circuitbreaker.instances` and `resilience4j.retry.instances`:
 
 | Setting | Value | Rationale |
 |---|---|---|
@@ -972,11 +979,9 @@ Both stubs are I/O calls to external services — must be wrapped.
 | Retry `maxAttempts` | 2 | 1 retry; gRPC is idempotent here |
 | Retry `waitDuration` | 200ms | |
 
-Do **not** use Resilience4j `TimeLimiter` for the gRPC timeout. `TimeLimiter` wraps calls in a `Future` and is designed for `CompletableFuture`-based async operations. For blocking gRPC stubs, apply the deadline directly on the stub: `stub.withDeadlineAfter(3, TimeUnit.SECONDS)`. This uses gRPC's own deadline propagation mechanism and is the correct approach for blocking stubs. Apply this in `FraudCheckService.evaluate()` and `FxService.lockRate()`.
+Do **not** use Resilience4j `TimeLimiter` for the gRPC timeout. `TimeLimiter` wraps calls in a `Future` and is designed for `CompletableFuture`-based async operations. For blocking gRPC stubs, apply the deadline directly on the stub: `stub.withDeadlineAfter(3, TimeUnit.SECONDS)`. This uses gRPC's own deadline propagation mechanism and is the correct approach for blocking stubs. Apply this in `GrpcFraudGateway.evaluate()` and `GrpcFxGateway.lockRate()`.
 
-`FraudCheckService.evaluate()` wraps the blocking stub call with Resilience4j `CircuitBreaker.decorateCheckedSupplier` + `Retry.decorateCheckedSupplier`. Throw a `FraudServiceUnavailableException` when the circuit is open — the saga catches this and transitions the transaction to `FAILED` with a recorded reason.
-
-Same pattern for `FxService.lockRate()` with its own circuit breaker instance.
+Throw a `FraudServiceUnavailableException` from the `GrpcFraudGateway` fallback method when the circuit is open — the saga catches this and transitions the transaction to `FAILED` with a recorded reason. Same pattern for `GrpcFxGateway.lockRate()` with its own circuit breaker instance.
 
 ---
 
@@ -1067,7 +1072,9 @@ No Jackson `@JsonTypeInfo` — type resolution is explicit via `value.default.ty
 
 The outbox table (`transaction_outbox`) is written **in the same local DB transaction** as the state change. The `@Transactional` boundary in `PaymentService` covers both the `transactions` insert/update and the `transaction_outbox` insert. Kafka is not touched inside the transaction.
 
-A separate `@Scheduled(fixedDelay = 500)` poller in `OutboxRelayService` runs 500ms after the previous execution completes:
+`OutboxRelayService` extends `AbstractOutboxRelayService<TransactionOutbox>` (see Phase 2.1 Pattern: Template Method). The abstract base class owns the scheduling, iteration, and retry accounting; `OutboxRelayService` overrides only `fetchPendingBatch`, `dispatch`, `markSent`, and `markFailed`. The `@Scheduled(fixedDelay = 500)` annotation lives on `AbstractOutboxRelayService.pollAndRelay()` which is `final` — subclasses cannot change the polling contract.
+
+The relay execution sequence:
 
 1. Fetch up to 50 rows WHERE `status = 'PENDING'` ORDER BY `created_at` (FIFO per transaction, via index).
 2. For each row: send to Kafka with `transactionId` as the message key (guarantees partition ordering).
@@ -1091,34 +1098,37 @@ Publishing directly from within the JPA transaction is the classic "dual write" 
 
 Fraud and FX are synchronous gRPC calls made **inside the REST request thread** before anything is written to the DB or Kafka. Rationale: the merchant waits for a synchronous response and needs an immediate answer on whether the payment was fraud-rejected or had an FX problem. Deferring these to async Kafka steps would require the merchant to poll for a result, which is more complex and not warranted here.
 
+The saga is implemented via `SagaOrchestrator` which dispatches each state transition to the appropriate `TransactionStateHandler` (see Phase 2.1 Pattern: Strategy). `PaymentService` calls `sagaOrchestrator.advance(tx, SagaContext.initial())` — all state-machine logic is encapsulated in the handler map. `FraudCheckingHandler` calls `FraudGateway.evaluate`; `FxLockingHandler` calls `FxGateway.lockRate`. `GrpcFraudGateway` and `GrpcFxGateway` in `service/adapter/` are the concrete implementations — `PaymentService` and `SagaOrchestrator` never reference them.
+
 ### Sequence (happy path — cross-currency)
 
 ```
-Client          PaymentController       PaymentService     FraudCheckService   FxService   DB (JPA tx)   OutboxRelay   Kafka
-  │                    │                      │                    │               │            │              │           │
-  │─POST /payments──►  │                      │                    │               │            │              │           │
-  │  Idempotency-Key   │                      │                    │               │            │              │           │
-  │                    │─submit(request,jwt)──►│                    │               │            │              │           │
-  │                    │                      │─persist RECEIVED──────────────────────────────►│              │           │
-  │                    │                      │  + audit_log(RECEIVED)────────────────────────►│              │           │
-  │                    │                      │  (single tx commit)────────────────────────── commit         │           │
-  │                    │                      │                    │               │            │              │           │
-  │                    │                      │─evaluate(...)─────►│               │            │              │           │
-  │                    │                      │◄─APPROVED──────────│               │            │              │           │
-  │                    │                      │─update FRAUD_APPROVED────────────────────────►│              │           │
-  │                    │                      │                    │               │            │              │           │
-  │                    │                      │─lockRate(...)──────────────────────►│          │              │           │
-  │                    │                      │◄─lockedRate────────────────────────│           │              │           │
-  │                    │                      │─update FX_LOCKED + lockedRate────────────────►│              │           │
-  │                    │                      │  + outbox(payment.submitted, PENDING)─────── commit         │           │
-  │                    │                      │                    │               │            │              │           │
-  │◄─202 Accepted──────│◄─PaymentResponse─────│                    │               │            │              │           │
-  │  {id, status=FX_LOCKED, lockedRate}                            │               │            │              │           │
-  │                    │                      │                    │               │            │   (500ms)     │           │
-  │                    │                      │                    │               │            │──poll PENDING─►           │
-  │                    │                      │                    │               │            │              │─send key=txId►
-  │                    │                      │                    │               │            │              │◄─ack        │
-  │                    │                      │                    │               │            │◄─mark SENT───│           │
+Client          PaymentController       PaymentService    SagaOrchestrator  GrpcFraudGateway  GrpcFxGateway  DB (JPA tx)  OutboxRelay  Kafka
+  │                    │                      │                  │                  │               │             │             │          │
+  │─POST /payments──►  │                      │                  │                  │               │             │             │          │
+  │  Idempotency-Key   │                      │                  │                  │               │             │             │          │
+  │                    │─submit(request,jwt)──►│                  │                  │               │             │             │          │
+  │                    │                      │─persist RECEIVED───────────────────────────────────────────────►│             │          │
+  │                    │                      │  + audit_log(RECEIVED)─────────────────────────────────────────►│             │          │
+  │                    │                      │  (single tx commit)──────────────────────────────────────────── commit        │          │
+  │                    │                      │                  │                  │               │             │             │          │
+  │                    │                      │─advance(tx)──────►│                  │               │             │             │          │
+  │                    │                      │                  │─evaluate(...)────►│               │             │             │          │
+  │                    │                      │                  │◄─APPROVED─────────│               │             │             │          │
+  │                    │                      │                  │─update FRAUD_APPROVED──────────────────────────────────────►│             │          │
+  │                    │                      │                  │                  │               │             │             │          │
+  │                    │                      │                  │─lockRate(...)──────────────────►│             │             │          │
+  │                    │                      │                  │◄─lockedRate──────────────────────│             │             │          │
+  │                    │                      │                  │─update FX_LOCKED + lockedRate──────────────────────────────►│             │          │
+  │                    │                      │◄─tx (FX_LOCKED)──│  + outbox(payment.submitted, PENDING)──────────────────── commit        │          │
+  │                    │                      │                  │                  │               │             │             │          │
+  │◄─202 Accepted──────│◄─PaymentResponse─────│                  │                  │               │             │             │          │
+  │  {id, status=FX_LOCKED, lockedRate}        │                  │                  │               │             │             │          │
+  │                    │                      │                  │                  │               │             │   (500ms)    │          │
+  │                    │                      │                  │                  │               │             │──poll PENDING►          │
+  │                    │                      │                  │                  │               │             │             │─send key=txId►
+  │                    │                      │                  │                  │               │             │             │◄─ack       │
+  │                    │                      │                  │                  │               │             │◄─mark SENT──│          │
 ```
 
 One outbox write per transaction, written after fraud and FX have succeeded. The `RECEIVED` state transition is recorded in `audit_log` directly — no outbox row for it. If fraud rejects, no outbox event is written and bank-connector never sees the payment.
@@ -1340,11 +1350,11 @@ In code, check `log.isDebugEnabled()` before serializing the DTO to a string —
 ### gRPC client payload logging — `GrpcClientLoggingAspect`
 
 ```java
-@Around("execution(public * hp.microservice.demo.transaction_service.service.FraudCheckService.*(..)) || execution(public * hp.microservice.demo.transaction_service.service.FxService.*(..))")
+@Around("execution(public * hp.microservice.demo.transaction_service.service.adapter.GrpcFraudGateway.*(..)) || execution(public * hp.microservice.demo.transaction_service.service.adapter.GrpcFxGateway.*(..))")
 public Object logGrpcCall(ProceedingJoinPoint pjp) throws Throwable { ... }
 ```
 
-Logs the proto request (INFO on entry), proto response (INFO on exit), `latencyMs`, and the Resilience4j outcome — distinguish `CallNotPermittedException` (circuit open) from a real gRPC `StatusRuntimeException` so ops can tell "circuit open" from "service actually failed".
+Logs the domain request object (INFO on entry), domain result (INFO on exit), `latencyMs`, and the Resilience4j outcome — distinguish `CallNotPermittedException` (circuit open) from a real gRPC `StatusRuntimeException` so ops can tell "circuit open" from "service actually failed". The aspect targets `GrpcFraudGateway` and `GrpcFxGateway` in `service/adapter/` — these are the only classes that see both the domain value objects and the gRPC call outcome, making them the correct interception point for redaction-aware logging.
 
 **Alternative — gRPC `ClientInterceptor`:** a `ClientInterceptor` can intercept at the transport layer and log raw headers + message bytes. Prefer AOP here because: (a) the domain-level service objects are already the right granularity for redaction; (b) the Resilience4j outcome is visible at the service method level, not at the transport level; (c) the `ClientInterceptor` approach would require proto `toString()` or custom marshalling to produce readable log output. The trade-off is that AOP misses low-level transport errors (e.g. connection refused before the stub is called) — those surface as exceptions caught by the aspect's catch block, so nothing is silently lost.
 
@@ -1417,15 +1427,17 @@ logging:
 
 | Test class | Covers |
 |---|---|
-| `PaymentServiceTest` | Saga happy path, fraud rejection, FX failure, state transitions |
-| `FraudCheckServiceTest` | Circuit breaker open path, retry, normal flow |
-| `FxServiceTest` | Rate lock happy path, timeout |
+| `PaymentServiceTest` | Submit happy path, duplicate idempotency key handling; mocks `SagaOrchestrator` and `TransactionRepository` — no knowledge of `FraudGateway` / `FxGateway` |
+| `FraudCheckingHandlerTest` | Fraud approved, rejected, REVIEW treated as pass; mocks `FraudGateway` interface — no gRPC stubs |
+| `FxLockingHandlerTest` | Rate lock happy path, `FxGateway` unavailable → `FAILED` state; mocks `FxGateway` interface |
+| `GrpcFraudGatewayTest` | Circuit breaker open path, retry, normal gRPC flow; uses `grpc-testing` in-process server |
+| `GrpcFxGatewayTest` | Rate lock happy path, timeout, `StatusRuntimeException` → typed domain exception |
 | `OutboxRelayServiceTest` | Polling logic, retry_count increment, FAILED cutoff |
 | `PaymentResultHandlerTest` | State machine advancement, illegal transition guard, manual ack |
 | `RestLoggingAspectTest` | `LogRedactor` is invoked; PAN present in DTO is masked before log output |
 | `GrpcClientLoggingAspectTest` | `LogRedactor` is invoked; circuit-open outcome logged as distinct case from `StatusRuntimeException` |
 
-Use `@ExtendWith(MockitoExtension.class)`. Mock repository interfaces and gRPC stubs.
+Use `@ExtendWith(MockitoExtension.class)`. At the service layer, mock domain interfaces (`FraudGateway`, `FxGateway`, `EventPublisher`) — never raw gRPC stubs. gRPC stub behaviour is exercised only in `GrpcFraudGatewayTest` and `GrpcFxGatewayTest` which use `grpc-testing` in-process servers.
 
 ### Repository slice tests (@DataJpaTest)
 
@@ -1582,13 +1594,13 @@ Note: 3 partitions matches the existing `kafka.yaml` init Job. If the init Job h
 | Phase | Task | Verification |
 |---|---|---|
 | **1** | Update `build.gradle` with all dependencies; create stub `application.yml` with `issuer-uri` and `datasource` placeholders (required before Phase 5 tests can load a Spring context) | `.\gradlew.bat :services:transaction-service:dependencies` from root resolves cleanly |
-| **2 / 2.1** | Create package skeleton (empty classes, no logic) using the Phase 2 layout, including all interfaces and abstract classes introduced in Phase 2.1 (`FraudGateway`, `FxGateway`, `TransactionStateHandler`, `PaymentValidationStep`, `AbstractOutboxRelayService`, `EventPublisher`, `TransactionOutboxFactory`, `AuditLogListener`) | `.\gradlew.bat :services:transaction-service:compileJava -x test` from root succeeds |
+| **2 / 2.1** | Create package skeleton (empty classes, no logic) using the Phase 2 layout, including all interfaces, abstract classes, and adapter stubs introduced in Phase 2.1 (`FraudGateway`, `FxGateway`, `TransactionStateHandler`, `PaymentValidationStep`, `AbstractOutboxRelayService`, `EventPublisher`, `TransactionOutboxFactory`, `AuditLogListener`, `GrpcFraudGateway`, `GrpcFxGateway` in `service/adapter/`) | `.\gradlew.bat :services:transaction-service:compileJava -x test` from root succeeds |
 | **3** | Write V1–V4 Flyway migrations | `@DataJpaTest` slice starts, schema created |
 | **4** | Implement `Transaction`, `TransactionStatus`, `TransactionOutbox`, `AuditLog`, `RoutingRule` entities | `@DataJpaTest` for `TransactionRepository` passes |
 | **5** | Implement `PaymentRequest`/`PaymentResponse` DTOs + `PaymentController` shell (no service logic) | `@WebMvcTest` 401 on unauthenticated, 400 on invalid body |
 | **6** | Implement `SecurityConfig` (JWT converter, role mapping, method security) | `@WebMvcTest` with `MERCHANT` JWT returns 200 shell response |
-| **7** | Implement `FraudCheckService` + `FxService` (gRPC stubs, Resilience4j wrapping) | Unit tests with mocked stubs pass |
-| **8** | Implement `PaymentService` saga logic (fraud → fx → outbox write) | `PaymentServiceTest` unit tests pass |
+| **7** | Implement `GrpcFraudGateway` + `GrpcFxGateway` in `service/adapter/` (`@CircuitBreaker` + `@Retry` annotations, stub deadline, `StatusRuntimeException` → domain exception); implement `FraudCheckingHandler` + `FxLockingHandler` with `FraudGateway`/`FxGateway` interfaces | `GrpcFraudGatewayTest` + `GrpcFxGatewayTest` with in-process gRPC servers pass; `FraudCheckingHandlerTest` + `FxLockingHandlerTest` with mocked interfaces pass |
+| **8** | Implement `SagaOrchestrator` + all `TransactionStateHandler` implementations; implement `PaymentService` (delegates to orchestrator) + outbox write via `TransactionOutboxFactory` | `PaymentServiceTest` unit tests pass |
 | **9** | Implement `KafkaProducerConfig` + `OutboxRelayService` (scheduler + KafkaTemplate) | `OutboxRelayServiceTest` passes; integration test shows `payment.submitted` on Kafka |
 | **10** | Implement `KafkaConsumerConfig` + `PaymentResultHandler` | Integration test: publish `payment.result` → transaction reaches `SUCCEEDED` |
 | **11** | Implement `PaymentControllerAdvice` (ProblemDetail error mapping) | Unit test: fraud rejection returns `422` with extension field |
